@@ -1,0 +1,83 @@
+python -m sglang.launch_server \
+  [your normal SGLang parameters...] \
+  --kt-method LLAMAFILE \
+  --kt-weight-path /home/kevin/models/Mixtral-8x7B-v0.1-GGUF \
+  --kt-cpuinfer 64 \
+  --kt-threadpool-count 2 \
+  --kt-num-gpu-experts 0 \
+  --kt-max-deferred-experts-per-token 0
+
+
+export SGLANG_APPLY_CONFIG_BACKUP=none
+
+python -m sglang.launch_server \
+    --host 0.0.0.0 \
+    --port 30000 \
+    --model /home/kevin/models/DeepSeek-V2-Lite \
+    --kt-weight-path /home/kevin/models/DeepSeek-V2-Lite-GGUF \
+    --kt-cpuinfer 32 \
+    --kt-threadpool-count 1 \
+    --quantization gguf \
+    --kt-num-gpu-experts 0 \
+    --kt-method LLAMAFILE \
+    --attention-backend flashinfer
+
+
+python -m sglang.launch_server \
+    --host 0.0.0.0 \
+    --port 30000 \
+    --model /home/kevin/models/Qwen3-30B-A3B \
+    --kt-weight-path /home/kevin/models/Qwen3-30B-A3B-GGUF \
+    --kt-cpuinfer 16 \
+    --kt-threadpool-count 1 \
+    --quantization gguf \
+    --kt-num-gpu-experts 0 \
+    --kt-method LLAMAFILE \
+    --disable-cuda-graph \
+    --max-total-tokens 1024 \
+    --attention-backend flashinfer
+
+Qwen3:
+python -m sglang.launch_server \
+    --host 0.0.0.0 \
+    --port 30000 \
+    --model /home/kevin/models/Qwen3-30B-A3B \
+    --kt-weight-path /home/kevin/models/Qwen3-30B-A3B-GGUF \
+    --kt-cpuinfer 12 \
+    --kt-threadpool-count 1 \
+    --kt-num-gpu-experts 0 \
+    --kt-method LLAMAFILE \
+    --mem-fraction-static 0.5 \
+    --max-total-tokens 512 \
+    --attention-backend flashinfer
+
+发送请求：
+curl http://localhost:30000/generate \
+  -H "Content-Type: application/json" \
+  -d '{
+    "text": "Explain how Mixture of Experts models work.",
+    "sampling_params": {
+      "temperature": 0.7,
+      "max_new_tokens": 512
+    }
+  }'
+
+开启CUDA graph:
+[2026-07-23 11:29:00] Prefill batch, #new-seq: 1, #new-token: 16, #cached-token: 0, token usage: 0.03, #running-req: 0, #queue-req: 0, input throughput (token/s): 0.04, cuda graph: False
+[2026-07-23 11:29:12] Decode batch, #running-req: 1, #token: 49, token usage: 0.10, cuda graph: True, gen throughput (token/s): 0.06, #queue-req: 0
+[2026-07-23 11:29:17] Decode batch, #running-req: 1, #token: 89, token usage: 0.17, cuda graph: True, gen throughput (token/s): 8.36, #queue-req: 0
+[2026-07-23 11:29:23] Decode batch, #running-req: 1, #token: 129, token usage: 0.25, cuda graph: True, gen throughput (token/s): 6.86, #queue-req: 0
+[2026-07-23 11:29:25] INFO:     127.0.0.1:55118 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+[2026-07-23 11:33:26] Prefill batch, #new-seq: 1, #new-token: 1, #cached-token: 15, token usage: 0.03, #running-req: 0, #queue-req: 0, input throughput (token/s): 0.06, cuda graph: False
+[2026-07-23 11:33:29] Decode batch, #running-req: 1, #token: 41, token usage: 0.08, cuda graph: True, gen throughput (token/s): 0.18, #queue-req: 0
+[2026-07-23 11:33:34] Decode batch, #running-req: 1, #token: 81, token usage: 0.16, cuda graph: True, gen throughput (token/s): 7.79, #queue-req: 0
+[2026-07-23 11:33:41] Decode batch, #running-req: 1, #token: 121, token usage: 0.24, cuda graph: True, gen throughput (token/s): 10.07, #queue-req: 0
+[2026-07-23 11:33:43] INFO:     127.0.0.1:37454 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+
+不开CUDA graph:
+[2026-07-23 11:44:51] Prefill batch, #new-seq: 1, #new-token: 1, #cached-token: 15, token usage: 0.03, #running-req: 0, #queue-req: 0, input throughput (token/s): 0.30, cuda graph: False
+
+[2026-07-23 11:44:55] Decode batch, #running-req: 1, #token: 41, token usage: 0.08, cuda graph: False, gen throughput (token/s): 1.03, #queue-req: 0
+[2026-07-23 11:44:59] Decode batch, #running-req: 1, #token: 81, token usage: 0.16, cuda graph: False, gen throughput (token/s): 9.79, #queue-req: 0
+[2026-07-23 11:45:05] Decode batch, #running-req: 1, #token: 121, token usage: 0.24, cuda graph: False, gen throughput (token/s): 8.94, #queue-req: 0
+[2026-07-23 11:45:08] INFO:     127.0.0.1:37084 - "POST /v1/chat/completions HTTP/1.1" 200 OK
