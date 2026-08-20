@@ -13,6 +13,14 @@
 #include "ggml-impl.h"
 #include "kvcache.h"
 
+/**
+ * @brief 将 KV cache 支持的 GGML 数据类型转换为可读字符串。
+ *
+ * 该辅助函数用于构造配置日志；未识别的枚举值返回 "UNDIFINED"。
+ *
+ * @param type 要转换的 GGML 数据类型枚举。
+ * @return 与 type 对应的固定字符串。
+ */
 std::string ggml_type_to_string(ggml_type type) {
   switch (type) {
     case GGML_TYPE_F32:
@@ -26,6 +34,12 @@ std::string ggml_type_to_string(ggml_type type) {
   }
   return "UNDIFINED";
 }
+/**
+ * @brief 将 block anchor 算法类型转换为可读字符串。
+ *
+ * @param type 要转换的 AnchorType 枚举。
+ * @return DYNAMIC、BLOCK_MEAN、BLOCK_MAX、FIXED_ANCHOR 或 QUEST；未知值返回 "UNDIFINED"。
+ */
 std::string AnchorTypeToString(AnchorType type) {
   switch (type) {
     case AnchorType::DYNAMIC:
@@ -41,6 +55,14 @@ std::string AnchorTypeToString(AnchorType type) {
   }
   return "UNDIFINED";
 }
+/**
+ * @brief 将 block 检索粒度转换为 Python 配置使用的可读名称。
+ *
+ * LAYER 映射为 SHARED，KVHEAD 映射为 SEPARATE，QHEAD 映射为 INDIVIDUAL。
+ *
+ * @param type 要转换的 RetrievalType 枚举。
+ * @return 对应的检索模式字符串；未知值返回 "UNDIFINED"。
+ */
 std::string RetrievalTypeToString(RetrievalType type) {
   switch (type) {
     case RetrievalType::LAYER:
@@ -52,6 +74,28 @@ std::string RetrievalTypeToString(RetrievalType type) {
   }
   return "UNDIFINED";
 }
+/**
+ * @brief 构造并校验 KV cache 的静态配置。
+ *
+ * 构造函数保存模型形状、block/anchor 策略、检索复用步长和容量上限，打印完整配置，并校验 Query head
+ * 数能够被 KV head 数整除，以保证 GQA 分组 n_gqa 为整数。
+ *
+ * @param layer_num 模型层数，也是 KV cache 的层维度。
+ * @param kv_head_num 每层 Key/Value head 数。
+ * @param q_head_num 每层 Query head 数。
+ * @param head_dim 每个 Attention head 的特征维度。
+ * @param block_len 每个物理 cache block 容纳的 token 数。
+ * @param anchor_num 每个 block 保存的检索 anchor 数。
+ * @param anchor_type 从 block K 和 importance 生成 anchor 的算法。
+ * @param kv_type 内部 K/V 存储类型，当前支持 FP16、Q4_0 和 Q8_0。
+ * @param retrieval_type block 选择粒度：整层共享、按 KV head 或按 Query head。
+ * @param layer_step 每隔多少层重新计算一次 block 选择。
+ * @param token_step 每隔多少个 decode token 重新计算一次 block 选择。
+ * @param layer_offset 刷新层在 layer_step 周期中的偏移量。
+ * @param max_block_num 每层最多预分配的物理 block 数。
+ * @param max_batch_size 最多预分配的 batch 数。
+ * @param max_thread_num 最多预分配的工作线程及线程局部缓冲区数量。
+ */
 KVCacheConfig::KVCacheConfig(int layer_num, int kv_head_num, int q_head_num, int head_dim, int block_len,
                              int anchor_num, AnchorType anchor_type, ggml_type kv_type, RetrievalType retrieval_type,
                              int layer_step, int token_step, int layer_offset, int max_block_num, int max_batch_size,
@@ -81,6 +125,14 @@ KVCacheConfig::KVCacheConfig(int layer_num, int kv_head_num, int q_head_num, int
       layer_offset, max_block_num, max_batch_size, max_thread_num);
   assert(q_head_num % kv_head_num == 0);
 }
+/**
+ * @brief 按配置创建 KV cache，并预分配检索、量化和 Attention 所需状态。
+ *
+ * 构造函数计算 GQA 分组大小，按 kv_type 创建对应的 K/V 容器，分配 anchor、importance 和历史选择状态，
+ * 再调用 ThreadResize()、BatchResize() 和 BlockResize() 建立全部线程、batch 和 block 维度的缓冲区。
+ *
+ * @param config 已完成校验的 KVCacheConfig；其容量字段决定本实例的预分配上限。
+ */
 KVCache::KVCache(KVCacheConfig config) {
   this->config_ = config;
 
@@ -118,6 +170,14 @@ KVCache::KVCache(KVCacheConfig config) {
   q_fp32.resize(n_gqa_ * config.head_dim);
 }
 
+/**
+ * @brief 调整每个工作线程独享的 Attention 临时缓冲区数量和大小。
+ *
+ * 每个线程获得 Q8 输出、Attention score、FP32 输出、LSE、在线 block 归并状态、尾块 mask 和 kernel
+ * draft 工作区，避免并行 block 计算时发生临时内存竞争。
+ *
+ * @param thread_num 需要支持的最大并行工作线程数；应不小于 WorkerPool 的线程数。
+ */
 void KVCache::ThreadResize(int thread_num) {
   thread_local_output_q8_0_.resize(thread_num);
   thread_local_attn_score_.resize(thread_num);
@@ -141,6 +201,14 @@ void KVCache::ThreadResize(int thread_num) {
     thread_local_attn_mask_[i].resize(config_.block_len / 8);
   }
 }
+/**
+ * @brief 调整所有按 batch 索引的 Query、输出、检索表和同步状态。
+ *
+ * 函数按 retrieval_type 分配 layer 共享或 per-head block 表与历史，给每个 (batch, KV head) 创建 mutex、
+ * Query 量化缓冲区、FP32 输出和 LSE，并分配每个 batch 的平均 Query 与稀疏度缓冲区。
+ *
+ * @param batch_size 需要预分配的最大 batch 数；运行时 batch 不得超过该值。
+ */
 void KVCache::BatchResize(int batch_size) {
   mutex_.resize(batch_size);
   q_q8_0_.resize(batch_size);
@@ -204,6 +272,15 @@ void KVCache::BatchResize(int batch_size) {
   }
 }
 
+/**
+ * @brief 调整全部按物理 block 索引的 KV、anchor 辅助状态和检索缓冲区。
+ *
+ * 函数分配 RoPE 表、历史选择、每层每 KV head 的 FP16/Q4_0/Q8_0 K/V block、每个 token 的 importance、
+ * similarity 和逻辑 block 表。K 使用 token-major 布局，V 使用适合 PV GEMM 的 [head_dim, block_len] 转置
+ * 布局；量化类型每 32 个元素保存一个量化块。
+ *
+ * @param max_block_num 每层要支持的最大物理 block 数，通常等于 config_.max_block_num。
+ */
 void KVCache::BlockResize(int max_block_num) {
   sin_.resize(max_block_num * config_.block_len);
   cos_.resize(max_block_num * config_.block_len);
@@ -310,6 +387,20 @@ void KVCache::BlockResize(int max_block_num) {
   }
 }
 
+/**
+ * @brief 为全部层和有效物理 block 生成用于稀疏检索的 FP16 anchor。
+ *
+ * 函数按 (layer, batch, logical block) 并行，并通过 block_table 定位物理 block。DYNAMIC 根据累计
+ * importance 选择重要 token 的 K 并聚合；BLOCK_MEAN 对 block 内 K 求均值；BLOCK_MAX 逐维取最大值；
+ * FIXED_ANCHOR 按固定步长采样并聚合；QUEST 为每个维度保存 block 内 K 的最大值与最小值。量化 cache
+ * 会先按 32 个元素反量化，再写入统一的 FP16 anchor_ 数组。
+ *
+ * @param block_table 行优先 [batch_size, max_block_num] 逻辑到物理 block 映射。
+ * @param cache_seqlens 每个 batch 的有效 token 数；超出范围的 block 会被跳过。
+ * @param batch_size 序列数量。
+ * @param max_block_num 每个序列参与遍历的 block 表宽度。
+ * @param backend 用于并行处理层、batch 和 block 的工作线程池。
+ */
 void KVCache::calc_anchor_all_layers(int* block_table, int* cache_seqlens, int batch_size, int max_block_num,
                                      WorkerPool* backend) {
   // Timer start
@@ -676,6 +767,18 @@ void KVCache::calc_anchor_all_layers(int* block_table, int* cache_seqlens, int b
   //    printf("time of calc_anchor_all_layers: %f s\n", duration.count());
 }
 
+/**
+ * @brief 清零全部层有效 block 的动态 token importance。
+ *
+ * 仅在 anchor_type 为 DYNAMIC 时执行实际清零。函数按 (layer, batch, logical block) 并行，通过
+ * block_table 定位物理 block，并把该 block 内所有 token、所有 Query head 的 importance 设为零。
+ *
+ * @param block_table 行优先 [batch_size, max_block_num] 逻辑到物理 block 映射。
+ * @param cache_seqlens 每个 batch 的有效 token 数，用于跳过 cache 范围外的 block。
+ * @param batch_size 序列数量。
+ * @param max_block_num 每个序列参与遍历的 block 表宽度。
+ * @param backend 用于并行清零各层和 block 的工作线程池。
+ */
 void KVCache::clear_importance_all_layers(int* block_table, int* cache_seqlens, int batch_size, int max_block_num,
                                           WorkerPool* backend) {
   // Timer start
@@ -716,6 +819,18 @@ void KVCache::clear_importance_all_layers(int* block_table, int* cache_seqlens, 
   //    duration.count());
 }
 
+/**
+ * @brief 清零全部层、全部 KV head 中由 block 表引用的有效 K/V block。
+ *
+ * 函数按 (layer, batch, logical block, KV head) 并行。FP16 模式把 K/V 元素全部设零；Q4_0/Q8_0 模式
+ * 把每个量化块的缩放因子 d 设零，使反量化结果为零。只处理 cache_seqlens 覆盖的逻辑 block。
+ *
+ * @param block_table 行优先 [batch_size, max_block_num] 逻辑到物理 block 映射。
+ * @param cache_seqlens 每个 batch 的有效 token 数，用于确定应清零的 block 范围。
+ * @param batch_size 序列数量。
+ * @param max_block_num 每个序列参与遍历的 block 表宽度。
+ * @param backend 用于并行清零层、block 和 KV head 的工作线程池。
+ */
 void KVCache::clear_kvcache_all_layers(int* block_table, int* cache_seqlens, int batch_size, int max_block_num,
                                        WorkerPool* backend) {
   // Timer start
@@ -763,6 +878,15 @@ void KVCache::clear_kvcache_all_layers(int* block_table, int* cache_seqlens, int
   //    printf("time of clear_kvcache_all_layers: %f s\n", duration.count());
 }
 
+/**
+ * @brief 把连续 FP16 RoPE sin/cos 表复制到 KVCache 的二维内部存储。
+ *
+ * 内部表随后可由 block Attention kernel 在需要在线旋转 Key 时按位置读取。
+ *
+ * @param sin 输入 FP16 sin 表，布局为 [seqlen, head_dim]。
+ * @param cos 输入 FP16 cos 表，布局为 [seqlen, head_dim]。
+ * @param seqlen 要复制的位置数量，不得超过 BlockResize() 预分配的 token 容量。
+ */
 void KVCache::get_sincos(ggml_fp16_t* sin, ggml_fp16_t* cos, int seqlen) {
   // Timer start
   auto start = std::chrono::high_resolution_clock::now();
@@ -783,6 +907,16 @@ void KVCache::get_sincos(ggml_fp16_t* sin, ggml_fp16_t* cos, int seqlen) {
   printf("time of get_sincos: %f s\n", duration.count());
 }
 
+/**
+ * @brief 将一个连续 FP32 向量原地乘以标量。
+ *
+ * 实现优先使用 Accelerate 或 GGML SIMD 向量指令，并用标量循环处理 SIMD 尾部；无加速后端时退化为
+ * 普通循环。Attention 的跨 block LSE 归并使用该函数重缩放局部输出。
+ *
+ * @param n 向量 y 中要缩放的元素数量。
+ * @param y 输入/输出 FP32 向量。
+ * @param v 乘到每个元素上的缩放系数。
+ */
 void ggml_vec_scale_f32(const int n, float* y, const float v) {
 #if defined(GGML_USE_ACCELERATE)
   vDSP_vsmul(y, 1, &v, y, 1, n);

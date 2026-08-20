@@ -15,6 +15,19 @@
 #include "kvcache.h"
 #include "llamafile/sgemm.h"
 
+/**
+ * @brief 按 KV head 独立的检索结果计算分块 Attention。
+ *
+ * 每个工作窃取任务处理一个 batch、一个 KV head 和一个已选 cache block。函数为共享该 KV head 的全部
+ * GQA query heads 计算精确 Attention，对未填满的尾块施加 mask，并通过 log-sum-exp 缩放合并各 block，
+ * 使结果等价于在所有已选 block 逻辑拼接后执行一次 softmax。
+ *
+ * @param q_in_data FP16 Query 数据，布局为 [batch_size, q_head_num, head_dim]。
+ * @param output FP16 Attention 输出，逻辑布局与 q_in_data 相同。
+ * @param attn_lse FP32 log-sum-exp 输出，每个 batch、每个 query head 对应一个值。
+ * @param batch_size 要处理的 Query 行数；调用方已经将 q_len 折叠到该维度中。
+ * @param backend 用于并行执行 block Attention 和线程结果归并的工作线程池。
+ */
 void KVCache::attention_kvhead_(const uint16_t* q_in_data, ggml_fp16_t* output, float* attn_lse, int batch_size,
                                 WorkerPool* backend) {
   // Timer start
@@ -241,6 +254,19 @@ void KVCache::attention_kvhead_(const uint16_t* q_in_data, ggml_fp16_t* output, 
   //        diff.count());
 }
 
+/**
+ * @brief 使用该层所有 KV head 共享的 block 表计算分块 Attention。
+ *
+ * 各个已选 block 被独立并行处理。每个 block 为某个 KV head 对应的 GQA Query head 组计算精确的 QK、
+ * softmax 和 PV，再通过 log-sum-exp 归一化合并 block 结果。传入完整 block 表时，该流程无需构造完整
+ * Attention 分数矩阵即可实现 dense paged Attention。
+ *
+ * @param q_in_data FP16 Query 数据，布局为 [batch_size, q_head_num, head_dim]。
+ * @param output FP16 Attention 输出，布局为 [batch_size, q_head_num, head_dim]。
+ * @param attn_lse FP32 log-sum-exp 输出，每个 query head 对应一个值。
+ * @param batch_size 要处理的 Query 行数；q_len 已经折叠到该维度中。
+ * @param backend 负责调度 (batch, KV head, block) 任务及其归并操作的工作线程池。
+ */
 void KVCache::attention_layer_(const uint16_t* q_in_data, ggml_fp16_t* output, float* attn_lse, int batch_size,
                                WorkerPool* backend) {
   // Timer start
@@ -466,6 +492,28 @@ void KVCache::attention_layer_(const uint16_t* q_in_data, ggml_fp16_t* output, f
   //     diff.count());
 }
 
+/**
+ * @brief 为一个模型层执行支持稀疏检索的 paged GQA Attention。
+ *
+ * 该总控入口准备或量化 Q，导入调用方提供的逻辑 block 到物理 block 映射，按需检索稀疏 block 子集，
+ * 最后调度精确的 block Attention。pick_block_num 为 -1 时跳过检索并计算全部有效 block，即 CPU dense
+ * Attention。
+ *
+ * @param q_in FP16 Query，形状为 [batch_size, q_len, q_head_num, head_dim]。
+ * @param output FP16 输出，形状与 q_in 相同。
+ * @param attn_lse FP32 log-sum-exp 输出，形状为 [batch_size, q_len, q_head_num]。
+ * @param layer_idx 要读取 KV cache 的模型层编号，从 0 开始。
+ * @param generate_token_idx Decode token 编号，用于判断能否复用历史检索结果。
+ * @param q_len 每个 batch 中的 Query token 数。
+ * @param batch_size batch 数量，内部尚未将 q_len 折叠到任务维度。
+ * @param max_block_num 每个 batch 可用的 block 表项数。
+ * @param block_table 可选的行优先 [batch_size, max_block_num] 逻辑 block 到物理 block 映射。
+ * @param cache_seqlens 每个 batch 当前有效的 KV cache token 数。
+ * @param pick_block_num 要检索的相似中间 block 数；-1 表示使用全部 block。
+ * @param init_block_num 始终保留的开头 block 数。
+ * @param local_block_num 始终保留的最近完整 block 数。
+ * @param backend 用于检索、block kernel 和结果归并的工作线程池。
+ */
 void KVCache::attn(const ggml_fp16_t* q_in, ggml_fp16_t* output, float* attn_lse, int layer_idx, int generate_token_idx,
                    int q_len, int batch_size, int max_block_num, int* block_table, int* cache_seqlens,
                    int pick_block_num, int init_block_num, int local_block_num, WorkerPool* backend) {
@@ -496,6 +544,28 @@ void KVCache::attn(const ggml_fp16_t* q_in, ggml_fp16_t* output, float* attn_lse
   //        diff.count());
 }
 
+/**
+ * @brief 将当前 decode token 追加到 KV cache，并基于更新后的 cache 计算 Attention。
+ *
+ * 这是供 Python 封装调用的 decode 入口。函数先把新 K/V 写入 paged 物理 block，增加各序列长度，计算
+ * 始终保留的开头 block 数，再调用 attn()。当前实现要求 q_len == 1。
+ *
+ * @param q_in 当前 token 的 FP16 Query，形状为 [batch_size, 1, q_head_num, head_dim]。
+ * @param k_in 当前 token 的 FP16 Key，形状为 [batch_size, 1, kv_head_num, head_dim]。
+ * @param v_in 当前 token 的 FP16 Value，形状为 [batch_size, 1, kv_head_num, head_dim]。
+ * @param output FP16 输出，形状为 [batch_size, 1, q_head_num, head_dim]。
+ * @param attn_lse FP32 log-sum-exp 输出，形状为 [batch_size, 1, q_head_num]。
+ * @param layer_idx 要更新和计算的模型层编号，从 0 开始。
+ * @param generate_token_idx 用于复用检索结果的 decode token 编号。
+ * @param q_len Query 长度；该 decode 接口要求值为 1。
+ * @param batch_size 相互独立的序列数量。
+ * @param max_block_num 每个序列的 block 表项数。
+ * @param block_table 行优先的逻辑 block 到物理 block 映射。
+ * @param cache_seqlens 输入/输出有效 token 数；执行 Attention 前会增加 q_len。
+ * @param topk 要检索的相似历史 block 数；-1 表示 dense Attention。
+ * @param local 始终保留的最近完整 block 数。
+ * @param backend 用于更新 cache 和计算 Attention 的工作线程池。
+ */
 void KVCache::attn_with_kvcache(const ggml_fp16_t* q_in, const ggml_fp16_t* k_in, const ggml_fp16_t* v_in,
                                 ggml_fp16_t* output, float* attn_lse, int layer_idx, int generate_token_idx, int q_len,
                                 int batch_size, int max_block_num, int* block_table, int* cache_seqlens, int topk,
@@ -529,6 +599,15 @@ void KVCache::attn_with_kvcache(const ggml_fp16_t* q_in, const ggml_fp16_t* k_in
   //     layer_idx, diff.count());
 }
 
+/**
+ * @brief 将 Query 转换为当前 KV-cache kernel 所需的表示形式。
+ *
+ * FP16 cache 模式把 Q 转换到每个 batch 的 FP32 临时缓冲区；量化 cache 模式则把每组 GQA Query heads
+ * 量化为 Q8_0，以便与 Q4_0 或 Q8_0 Key 相乘。
+ *
+ * @param q_in_data FP16 Query 位数据，布局为 [batch_size, q_head_num, head_dim]。
+ * @param batch_size 要转换的 Query 行数。
+ */
 void KVCache::quantize_q_(const uint16_t* q_in_data, int batch_size) {
   // Timer start
   auto start = std::chrono::high_resolution_clock::now();
@@ -558,6 +637,18 @@ void KVCache::quantize_q_(const uint16_t* q_in_data, int batch_size) {
   // printf("time of quantizing q: %f s\n",
   //        std::chrono::duration<double>(end - start).count());
 }
+/**
+ * @brief 重置 Attention 累加状态，并导入该层所有 KV head 共享的逻辑 block 表。
+ *
+ * 函数清空输出和 LSE 临时缓冲区、清空检索堆、复制序列长度，并暂存调用方 block 映射。block_table
+ * 为空时，函数根据内部已存 block 构造单位映射，并同步更新 max_block_num。
+ *
+ * @param batch_size 要初始化的逻辑 Query 行数。
+ * @param layer_idx 当前模型层；block_table 为空时用于读取该层内部 block 数。
+ * @param block_table 可选的行优先 [batch_size, max_block_num] 逻辑到物理 block 映射。
+ * @param max_block_num 输入/输出 block 表宽度；构造单位映射时改为内部已存 block 数。
+ * @param cache_seqlens 可选的每行有效 token 数；提供 block_table 时必须有效。
+ */
 void KVCache::attn_initialize_layer_(int batch_size, int layer_idx, int* block_table, int& max_block_num,
                                      int* cache_seqlens) {
   // Timer start
@@ -605,6 +696,24 @@ void KVCache::attn_initialize_layer_(int batch_size, int layer_idx, int* block_t
   //        std::chrono::duration<double>(end - start).count());
 }
 
+/**
+ * @brief 为 layer 共享的 Top-K 检索计算候选 block 与 Q 的相似度。
+ *
+ * 开头和 local window block 会被无条件保留，因此不参与打分。候选分数由预计算 block anchor 近似。
+ * 常见的单 batch、单 anchor 路径对连续 anchor 执行一次 SGEMM；通用路径逐维取多个 anchor 的最大乘积，
+ * 再跨 Query heads 求和。
+ *
+ * @param q_in_data FP16 Query，形状为 [batch_size, q_len, q_head_num, head_dim]。
+ * @param batch_size 要打分的序列数量。
+ * @param layer_idx 要读取 anchor 的模型层。
+ * @param q_len 用于计算平均 Query 的 token 数。
+ * @param max_block_num 输入 block 表宽度。
+ * @param cache_seqlens 调用方序列长度；保留该参数以统一接口，实际边界使用内部副本。
+ * @param init_block_num 不参与打分的开头 block 数。
+ * @param local_block_num 不参与打分的尾部完整 block 数。
+ * @param pick_block_num 目标 Top-K 数；真正选择由 select_block_layer_() 完成。
+ * @param backend 用于并行执行 SGEMM 或逐 block 打分的工作线程池。
+ */
 void KVCache::calculate_block_similarity_layer_(const uint16_t* q_in_data, int batch_size, int layer_idx, int q_len,
                                                 int max_block_num, int* cache_seqlens, int init_block_num,
                                                 int local_block_num, int pick_block_num, WorkerPool* backend) {
@@ -734,6 +843,19 @@ void KVCache::calculate_block_similarity_layer_(const uint16_t* q_in_data, int b
   //        diff.count());
 }
 
+/**
+ * @brief 由 prefix、Top-K、local 和尾块构造 layer 共享的检索后 block 表。
+ *
+ * 有界最小堆保留分数最高的中间 block。输出表依次拼接始终保留的 prefix、检索出的中间 block、最近
+ * local window，以及存在时尚未填满的尾块；选择结果会保存，供后续层或 decode token 复用。
+ *
+ * @param batch_size 要构造 block 表的序列数量。
+ * @param layer_idx 用于索引检索历史的模型层。
+ * @param max_block_num 原始 block 表宽度。
+ * @param init_block_num 始终保留的最早 block 数。
+ * @param local_block_num 始终保留的最近完整 block 数。
+ * @param pick_block_num 最多保留的已打分中间 block 数。
+ */
 void KVCache::select_block_layer_(int batch_size, int layer_idx, int max_block_num, int init_block_num,
                                   int local_block_num, int pick_block_num) {
   // Timer start
@@ -791,11 +913,25 @@ void KVCache::select_block_layer_(int batch_size, int layer_idx, int max_block_n
   //        diff.count());
 }
 
-// retrieval kvcache, get the init_block_num block at beginning, top
-// pick_block_num similar and last local_block_num blocks. Each task
-// calculates the simlarity of a certain block with the query, then push
-// the block into the priority queue. Finally, the required blocks are
-// pushed into the block_table_after_retrieval_.
+/**
+ * @brief 选择或复用将参与精确 Attention 的 layer 共享 KV block。
+ *
+ * 在配置的刷新层和 decode 步，函数为候选 block 打分并选择 prefix + Top-K + local + 尾块；两次刷新
+ * 之间直接恢复历史选择，并处理新出现的尾块。pick_block_num 为 -1 时跳过检索，转发完整输入 block
+ * 表以执行 dense Attention。
+ *
+ * @param q_in_data 需要刷新检索结果时用于打分的 FP16 Query。
+ * @param init_block_num 始终保留的开头 block 数。
+ * @param local_block_num 始终保留的最近完整 block 数。
+ * @param pick_block_num 相似中间 block 预算；-1 表示关闭稀疏检索。
+ * @param q_len 相似度计算使用的 Query token 数。
+ * @param generate_token_idx 与 config_.token_step 配合使用的 decode token 编号。
+ * @param batch_size 序列数量。
+ * @param layer_idx 与 config_.layer_step 配合并用于保存历史的当前层编号。
+ * @param cache_seqlens 调用方有效 token 数，用于检测新创建的尾块。
+ * @param max_block_num 输入/输出可用 block 表宽度。
+ * @param backend 刷新分数时使用的工作线程池。
+ */
 void KVCache::retrieval_kvcache_layer_(const uint16_t* q_in_data, int init_block_num, int local_block_num,
                                        int pick_block_num, int q_len, int generate_token_idx, int batch_size,
                                        int layer_idx, int* cache_seqlens, int& max_block_num, WorkerPool* backend) {
@@ -846,6 +982,21 @@ void KVCache::retrieval_kvcache_layer_(const uint16_t* q_in_data, int init_block
   //     printf("layer %d time of retrieval kvcache: %f s\n", layer_idx,
   //     std::chrono::duration<double>(end - start).count());
 }
+/**
+ * @brief 测量 layer 共享的已选 block 对每个 Query head 保留的 Attention 质量。
+ *
+ * 函数分别在原始 block 表和检索后 block 表上计算 Attention 统计量，再报告已选集合保留了多少完整
+ * Attention 分布。该函数仅用于分析，不生成模型激活值。
+ *
+ * @param q_in_data 用于计算 Attention 分数的 FP16 Query。
+ * @param attn_sparsity FP32 输出数组，每个 Query head 写入一个保留质量或稀疏度值。
+ * @param batch_size 序列数量。
+ * @param max_block_num 已选 block 表宽度。
+ * @param block_table_origin 原始完整的逻辑到物理 block 映射。
+ * @param cache_seqlens_origin 完整 cache 的原始有效 token 数。
+ * @param max_block_num_origin block_table_origin 的宽度。
+ * @param backend 用于 block Attention 和结果归并的工作线程池。
+ */
 void KVCache::calculate_sparsity_layer_(const uint16_t* q_in_data, float* attn_sparsity, int batch_size,
                                         int max_block_num, int* block_table, int* cache_seqlens, WorkerPool* backend
 
@@ -1070,6 +1221,18 @@ void KVCache::calculate_sparsity_layer_(const uint16_t* q_in_data, float* attn_s
   //        diff.count());
 }
 
+/**
+ * @brief 重置累加状态，并把输入 block 表扩展为按 KV head 独立检索的形式。
+ *
+ * 调用方为每个序列提供一份逻辑 block 映射。函数把该映射复制到每个 KV-head 通道，清空相似度和输出
+ * 状态，并记录有效序列长度，供后续打分和 Attention 使用。
+ *
+ * @param batch_size 序列数量。
+ * @param layer_idx 当前层编号；保留该参数以与 layer 共享初始化接口一致。
+ * @param block_table 行优先 [batch_size, max_block_num] 逻辑到物理 block 映射。
+ * @param max_block_num 输入/输出可供检索使用的 block 表宽度。
+ * @param cache_seqlens 每个序列的有效 token 数。
+ */
 void KVCache::attn_initialize_kvhead_(int batch_size, int layer_idx, int* block_table, int& max_block_num,
                                       int* cache_seqlens) {
   // Timer start
@@ -1104,6 +1267,24 @@ void KVCache::attn_initialize_kvhead_(int batch_size, int layer_idx, int* block_
   // printf("layer %d time of initializing attn: %f s\n", layer_idx,
   //        std::chrono::duration<double>(end - start).count());
 }
+/**
+ * @brief 为每个 KV head 选择或复用一份独立的检索后 block 表。
+ *
+ * 刷新步骤按 KV head 独立打分和选择 block，其余步骤恢复已保存的选择。pick_block_num 为 -1 时把所有
+ * 输入 block 复制到每个 KV-head 表，从而启用 dense GQA Attention。
+ *
+ * @param q_in_data 用于检索打分的 FP16 Query。
+ * @param init_block_num 每个 KV head 始终保留的开头 block 数。
+ * @param local_block_num 每个 KV head 始终保留的最近完整 block 数。
+ * @param pick_block_num 每个 KV head 的相似中间 block 预算；-1 表示使用全部 block。
+ * @param q_len 计算平均 Q 时使用的 Query token 数。
+ * @param generate_token_idx 控制选择结果复用的 decode token 编号。
+ * @param batch_size 序列数量。
+ * @param layer_idx 控制选择复用并索引历史的当前层编号。
+ * @param cache_seqlens 调用方有效 token 数。
+ * @param max_block_num 输入/输出可用 block 表宽度。
+ * @param backend 用于打分的工作线程池。
+ */
 void KVCache::retrieval_kvcache_kvhead_(const uint16_t* q_in_data, int init_block_num, int local_block_num,
                                         int pick_block_num, int q_len, int generate_token_idx, int batch_size,
                                         int layer_idx, int* cache_seqlens, int& max_block_num, WorkerPool* backend) {
@@ -1173,6 +1354,21 @@ void KVCache::retrieval_kvcache_kvhead_(const uint16_t* q_in_data, int init_bloc
   // printf("layer %d time of retrieval kvcache: %f s\n", layer_idx,
   //        std::chrono::duration<double>(end - start).count());
 }
+/**
+ * @brief 测量每个 KV head 使用独立 block 表时保留的 Attention 质量。
+ *
+ * 函数在已选 cache 和原始 cache 上计算精确的 block Attention 统计量，并归并为每个 Query head 一个
+ * 诊断值。该路径用于分析稀疏度，不生成推理输出。
+ *
+ * @param q_in_data 用于计算 Attention 分数的 FP16 Query。
+ * @param attn_sparsity FP32 诊断值输出，每个 Query head 对应一个值。
+ * @param batch_size 序列数量。
+ * @param max_block_num 已选 per-KV-head block 表宽度。
+ * @param block_table_origin 原始完整的逻辑到物理 block 映射。
+ * @param cache_seqlens_origin 原始有效 token 数。
+ * @param max_block_num_origin block_table_origin 的宽度。
+ * @param backend 用于 Attention 任务和结果归并的工作线程池。
+ */
 void KVCache::calculate_sparsity_kvhead_(const uint16_t* q_in_data, float* attn_sparsity, int batch_size,
                                          int max_block_num, int* block_table, int* cache_seqlens, WorkerPool* backend) {
   // Timer start
@@ -1395,6 +1591,24 @@ void KVCache::calculate_sparsity_kvhead_(const uint16_t* q_in_data, float* attn_
   // printf("layer %d time of calculating sparsity: %f s\n", layer_id_,
   //        diff.count());
 }
+/**
+ * @brief 按 KV head 独立计算候选 block 的相似度分数。
+ *
+ * 对每个候选 block，Query heads 会映射到其共享的 KV head。分数在每个维度上取多个 anchor 的最大
+ * Query-anchor 乘积，再对该 KV head 对应的 Query heads 和全部维度求和。prefix 和 local block 会被
+ * 无条件保留，因此不参与打分。
+ *
+ * @param q_in_data FP16 Query，形状为 [batch_size, q_len, q_head_num, head_dim]。
+ * @param batch_size 序列数量。
+ * @param layer_idx 要读取 anchor 的模型层。
+ * @param q_len 用于计算平均 Q 的 Query token 数。
+ * @param max_block_num 输入 block 表宽度。
+ * @param cache_seqlens 调用方有效 token 数；候选范围由内部副本确定。
+ * @param init_block_num 不参与打分的开头 block 数。
+ * @param local_block_num 不参与打分的最近完整 block 数。
+ * @param pick_block_num 每个 KV head 的目标 Top-K 数。
+ * @param backend 用于并行计算 block 分数的工作线程池。
+ */
 void KVCache::calculate_block_similarity_kvhead_(const uint16_t* q_in_data, int batch_size, int layer_idx, int q_len,
                                                  int max_block_num, int* cache_seqlens, int init_block_num,
                                                  int local_block_num, int pick_block_num, WorkerPool* backend) {
@@ -1443,6 +1657,19 @@ void KVCache::calculate_block_similarity_kvhead_(const uint16_t* q_in_data, int 
   // printf("layer %d time of calculating similarity: %f s\n", layer_idx,
   //        diff.count());
 }
+/**
+ * @brief 为每个 KV head 构造一份检索后的 block 表。
+ *
+ * 对每个序列和 KV head，有界最小堆保留分数最高的中间 block。函数拼接 prefix、检索结果、local 和
+ * 未填满的尾块，再保存选择结果，供非刷新层或后续 token 复用。
+ *
+ * @param batch_size 序列数量。
+ * @param layer_idx 用于索引检索历史的模型层。
+ * @param max_block_num 原始 block 表宽度。
+ * @param init_block_num 始终保留的最早 block 数。
+ * @param local_block_num 始终保留的最近完整 block 数。
+ * @param pick_block_num 每个 KV head 最多保留的已打分中间 block 数。
+ */
 void KVCache::select_block_kvhead_(int batch_size, int layer_idx, int max_block_num, int init_block_num,
                                    int local_block_num, int pick_block_num) {
   // Timer start
@@ -1511,6 +1738,28 @@ void KVCache::select_block_kvhead_(int batch_size, int layer_idx, int max_block_
   //        diff.count())
 }
 
+/**
+ * @brief 对外诊断入口：执行 block 检索并测量其保留的 Attention 质量。
+ *
+ * 函数按正常 Attention 相同的方式准备 Q，执行配置的 layer 或 KV-head 检索策略，再由对应稀疏度分析
+ * kernel 将已选 cache 与原始完整 cache 比较。
+ *
+ * @param q_in FP16 Query，形状为 [batch_size, q_len, q_head_num, head_dim]。
+ * @param attn_sparsity FP32 稀疏度或保留质量输出，每个 Query head 对应一个值。
+ * @param layer_idx 要分析的模型层。
+ * @param generate_token_idx 控制检索刷新的 decode token 编号。
+ * @param q_len Query token 数。
+ * @param batch_size 序列数量。
+ * @param max_block_num 候选 block 表宽度。
+ * @param block_table 候选逻辑到物理 block 映射。
+ * @param cache_seqlens 候选 cache 的有效 token 数。
+ * @param block_table_origin 作为基准的完整 cache 逻辑到物理 block 映射。
+ * @param cache_seqlens_origin 完整 cache 的有效 token 数。
+ * @param max_block_num_origin block_table_origin 的宽度。
+ * @param topk 相似中间 block 预算；-1 表示选择完整 cache。
+ * @param local 始终保留的尾部完整 block 数。
+ * @param backend 用于检索和分析的工作线程池。
+ */
 void KVCache::get_attn_sparsity(const ggml_fp16_t* q_in, float* attn_sparsity, int layer_idx, int generate_token_idx,
                                 int q_len, int batch_size, int max_block_num, int* block_table, int* cache_seqlens,
                                 int* block_table_origin, int* cache_seqlens_origin, int max_block_num_origin, int topk,
@@ -1539,6 +1788,41 @@ void KVCache::get_attn_sparsity(const ggml_fp16_t* q_in, float* attn_sparsity, i
   }
 }
 
+/**
+ * @brief 为一个物理 KV-cache block 计算精确的 scaled dot-product Attention。
+ *
+ * kernel 依次计算 QK、缩放、可选 bit mask、block 内 softmax 和 PV。它支持 FP16 Q/K/V，也支持 Q8_0
+ * Query 与 Q4_0 或 Q8_0 cache 配对。返回的 block 输出和 LSE 足以让调用方合并多个 block，得到对逻辑
+ * cache 的精确 softmax 结果。
+ *
+ * @param head_dim 每个 Query、Key 和 Value head 的特征宽度；必须能被 32 整除。
+ * @param bsz 同时计算的 Query head 数，通常等于 GQA 分组大小 n_gqa。
+ * @param q_type q 的存储类型，只支持 FP16 或 Q8_0。
+ * @param q Query 矩阵，形状为 [bsz, head_dim]。
+ * @param past_kv_len 当前 block 缓冲区中的 token 位置数，通常为 config_.block_len。
+ * @param past_kv_offset 当前 block 的预留逻辑偏移；核心计算目前未使用。
+ * @param is_full_attn 为 true 表示全部 token 位置有效，无需 mask。
+ * @param attn_mask 可选的压缩 bit mask，用于标识未填满 block 中 past_kv_len 个位置的有效性。
+ * @param k_type k_cache 的存储类型：FP16、Q4_0 或 Q8_0。
+ * @param k_quant_type Key 的量化轴选择；当前要求为按 token 量化，即 0。
+ * @param k_cache Key block，逻辑形状为 [past_kv_len, head_dim]。
+ * @param num_k_anchor 在线 Key anchor 数；当前要求为 0。
+ * @param k_cache_anchors 可选 Key anchor 数据；num_k_anchor 为 0 时不使用。
+ * @param k_cache_anchor_pos 可选 Key anchor 位置；num_k_anchor 为 0 时不使用。
+ * @param v_type v_cache 的存储类型：FP16、Q4_0 或 Q8_0。
+ * @param v_quant_type Value 的量化轴选择；当前要求为按通道量化，即 1。
+ * @param v_cache Value block，逻辑存储形状为 [head_dim, past_kv_len]。
+ * @param num_v_anchor 在线 Value anchor 数；当前要求为 0。
+ * @param v_cache_anchors 可选 Value anchor 数据；num_v_anchor 为 0 时不使用。
+ * @param v_cache_anchor_pos 可选 Value anchor 位置；num_v_anchor 为 0 时不使用。
+ * @param attn_score 调用方提供的 FP32 临时缓冲区，形状为 [bsz, past_kv_len]。
+ * @param output block 输出，形状为 [bsz, head_dim]，表示类型由 q_type 决定。
+ * @param lse FP32 block log-sum-exp 输出，形状为 [bsz]。
+ * @param draft 调用方提供的临时工作区，大小要求见 kvcache.h 中的函数声明。
+ * @param rotary_angle 可选的逐 token 旋转位置编号，用于在线旋转 Key。
+ * @param rotary_cos rotary_angle 非空时使用的可选 FP16 RoPE cos 表。
+ * @param rotary_sin rotary_angle 非空时使用的可选 FP16 RoPE sin 表。
+ */
 void KVCache::attn_with_kvcache_one_block_(int head_dim, int bsz,
                                            ggml_type q_type,  // GGML data type of `Q`, only supports fp16 and q8_0
                                            // [bsz, head_dim]

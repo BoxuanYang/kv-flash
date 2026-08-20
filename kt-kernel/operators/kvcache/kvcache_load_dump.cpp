@@ -14,6 +14,16 @@
 
 #include "kvcache.h"
 
+/**
+ * @brief 从二进制文件恢复完整的 KV cache、anchor 和 token importance。
+ *
+ * 文件开头保存有效 token 总数，随后依次保存全部 anchor、各层各 KV head 的有效 K/V block，以及各层
+ * 的 token importance。函数根据有效 token 数恢复每层 past_block_num_，并按当前 KVCacheConfig 的数据
+ * 类型和预分配形状读取数据；因此加载文件时必须使用与写出时一致的模型和 cache 配置。
+ *
+ * @param tensor_file_path 要读取的二进制 KV cache 文件路径。
+ * @param backend 预留的工作线程池参数；当前实现采用串行文件读取，未使用该参数。
+ */
 void KVCache::load_kvcache(std::string tensor_file_path, WorkerPool* backend) {
   // Timer start
   auto start = std::chrono::high_resolution_clock::now();
@@ -57,6 +67,18 @@ void KVCache::load_kvcache(std::string tensor_file_path, WorkerPool* backend) {
   std::chrono::duration<double> diff = end - start;
   printf("time of load: %f s\n", diff.count());
 }
+/**
+ * @brief 按逻辑 block 顺序把 KV cache、anchor 和 token importance 写入二进制文件。
+ *
+ * 函数先写有效 token 总数和完整 anchor 数组，再通过 block_table 将逻辑 block 映射为物理 block，按层、
+ * KV head 和 block 顺序写出 K/V，最后以相同逻辑顺序写出 importance。输出可由 load_kvcache() 在配置
+ * 完全一致的 KVCache 实例中恢复。
+ *
+ * @param block_table 一维逻辑到物理 block 映射；至少包含覆盖 cache_total_len 的 block 数。
+ * @param cache_total_len 要持久化的有效 token 总数，用于计算应写出的 block 数和尾块范围。
+ * @param tensor_file_path 输出二进制文件路径；文件存在时会被覆盖。
+ * @param backend 预留的工作线程池参数；当前实现采用串行文件写入，未使用该参数。
+ */
 void KVCache::dump_kvcache(int* block_table, int cache_total_len, std::string tensor_file_path, WorkerPool* backend) {
   // Timer start
   auto start = std::chrono::high_resolution_clock::now();
