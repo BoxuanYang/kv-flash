@@ -20,11 +20,12 @@ CUDA_VISIBLE_DEVICES=2 python -m sglang.launch_server \
     --port 30000 \
     --model /data2/models/Qwen3-30B-A3B \
     --kt-weight-path /data2/models/Qwen3-30B-A3B-GGUF \
-    --kt-cpuinfer 64 \
+    --kt-cpuinfer 128 \
     --kt-threadpool-count 2 \
     --kt-num-gpu-experts 0 \
     --kt-method LLAMAFILE \
     --mem-fraction-static 0.5 \
+    --disable-cuda-graph \
     --kt-max-deferred-experts-per-token 0 \
     --max-total-tokens 2048 \
     --attention-backend flashinfer
@@ -35,7 +36,7 @@ CUDA_VISIBLE_DEVICES=2 python -m sglang.launch_server \
 curl http://localhost:30000/generate \
   -H "Content-Type: application/json" \
   -d '{
-    "text": "你是垃圾吗？",
+    "text": "你好，请介绍一下自己",
     "sampling_params": {
       "temperature": 0.7,
       "max_new_tokens": 1024

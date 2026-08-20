@@ -390,6 +390,8 @@ class BaseMoEWrapper(_MoEBase, ABC):
             topk_weights: Top-k expert weights [batch_size, num_experts_per_tok]
             cuda_stream: CUDA stream for synchronization
         """
+
+        # 执行
         flat_hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
         batch_size = flat_hidden_states.shape[0]
 
@@ -424,6 +426,19 @@ class BaseMoEWrapper(_MoEBase, ABC):
         immediate_experts_ids_cpu[current_slot].copy_(immediate_ids, non_blocking=True)
 
         incremental = BaseMoEWrapper._layer_has_pending_deferred.get(self.layer_idx - 1, False)
+
+        # kt_kernel_ext: 在ext_bindings.cpp被定义
+        
+        # type(self.cpu_infer): <class 'kt_kernel_ext.CPUInfer'>
+        # type(self.moe): <class 'kt_kernel_ext.moe.MOE'>
+
+        print(f"type(bsz_slot_tensor): {type(bsz_slot_tensor)}, bsz_slot_tensor.shape: {bsz_slot_tensor.shape}, bsz_slot_tensor.device: {bsz_slot_tensor.device}")
+        print(f"type(immediate_experts_ids_cpu[current_slot]): {type(immediate_experts_ids_cpu[current_slot])}, immediate_experts_ids_cpu[current_slot].shape: {immediate_experts_ids_cpu[current_slot].shape}, immediate_experts_ids_cpu[current_slot].device: {immediate_experts_ids_cpu[current_slot].device}")
+        print(f"type(weights_cpu[current_slot]): {type(weights_cpu[current_slot])}, weights_cpu[current_slot].shape: {weights_cpu[current_slot].shape}, weights_cpu[current_slot].device: {weights_cpu[current_slot].device}")
+        print(f"type(input_tensor_cpu[current_slot]): {type(input_tensor_cpu[current_slot])}, input_tensor_cpu[current_slot].shape: {input_tensor_cpu[current_slot].shape}, input_tensor_cpu[current_slot].device: {input_tensor_cpu[current_slot].device}")
+        print(f"type(output_cpu[current_slot]): {type(output_cpu[current_slot])}, output_cpu[current_slot].shape: {output_cpu[current_slot].shape}, output_cpu[current_slot].device: {output_cpu[current_slot].device}")
+        
+
         self.cpu_infer.submit_with_cuda_stream(
             cuda_stream,
             self.moe.forward_task(
