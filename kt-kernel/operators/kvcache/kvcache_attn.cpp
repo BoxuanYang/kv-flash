@@ -73,6 +73,8 @@ void KVCache::attention_kvhead_(const uint16_t* q_in_data, ggml_fp16_t* output, 
           for (int i = full_blocks + 1; i < seq_len_ / 8; ++i) {
             thread_local_attn_mask_[thread_id][i] = 0;
           }
+
+          // 只看这个
           if (config_.kv_type == ggml_type::GGML_TYPE_F16) {
             attn_with_kvcache_one_block_(config_.head_dim, config_.q_head_num / config_.kv_head_num, GGML_TYPE_F16,
                                          (void*)&q_in_data[batch_id * config_.kv_head_num * n_gqa_ * config_.head_dim +
@@ -84,7 +86,10 @@ void KVCache::attention_kvhead_(const uint16_t* q_in_data, ggml_fp16_t* output, 
                                          thread_local_output_fp32_[thread_id].data(),
                                          thread_local_attn_lse_[thread_id].data(),
                                          thread_local_draft_[thread_id].data(), nullptr, cos_.data(), sin_.data());
-          } else if (config_.kv_type == ggml_type::GGML_TYPE_Q4_0) {
+          } 
+          
+          // 忽略
+          else if (config_.kv_type == ggml_type::GGML_TYPE_Q4_0) {
             attn_with_kvcache_one_block_(
                 config_.head_dim, config_.q_head_num / config_.kv_head_num, GGML_TYPE_Q8_0,
                 q_q8_0_[batch_id][head_id].data(), seq_len_, 0, false, thread_local_attn_mask_[thread_id].data(),
@@ -95,7 +100,10 @@ void KVCache::attention_kvhead_(const uint16_t* q_in_data, ggml_fp16_t* output, 
                 sin_.data());
             dequantize_row_q8_0(thread_local_output_q8_0_[thread_id].data(),
                                 thread_local_output_fp32_[thread_id].data(), n_gqa_ * config_.head_dim);
-          } else if (config_.kv_type == ggml_type::GGML_TYPE_Q8_0) {
+          } 
+          
+          // 忽略
+          else if (config_.kv_type == ggml_type::GGML_TYPE_Q8_0) {
             attn_with_kvcache_one_block_(
                 config_.head_dim, config_.q_head_num / config_.kv_head_num, GGML_TYPE_Q8_0,
                 q_q8_0_[batch_id][head_id].data(), seq_len_, 0, false, thread_local_attn_mask_[thread_id].data(),
@@ -108,6 +116,7 @@ void KVCache::attention_kvhead_(const uint16_t* q_in_data, ggml_fp16_t* output, 
                                 thread_local_output_fp32_[thread_id].data(), n_gqa_ * config_.head_dim);
           }
         } else {
+          // 只看这个
           if (config_.kv_type == ggml_type::GGML_TYPE_F16) {
             attn_with_kvcache_one_block_(
                 config_.head_dim, config_.q_head_num / config_.kv_head_num, GGML_TYPE_F16,
@@ -119,7 +128,10 @@ void KVCache::attention_kvhead_(const uint16_t* q_in_data, ggml_fp16_t* output, 
                 thread_local_attn_lse_[thread_id].data(), thread_local_draft_[thread_id].data(), nullptr, cos_.data(),
                 sin_.data());
 
-          } else if (config_.kv_type == ggml_type::GGML_TYPE_Q4_0) {
+          } 
+          
+          // 忽略
+          else if (config_.kv_type == ggml_type::GGML_TYPE_Q4_0) {
             attn_with_kvcache_one_block_(config_.head_dim, config_.q_head_num / config_.kv_head_num, GGML_TYPE_Q8_0,
                                          q_q8_0_[batch_id][head_id].data(), seq_len_, 0, true, nullptr, GGML_TYPE_Q4_0,
                                          0, k_cache_q4[layer_id_][head_id][block_idx].data(), 0, nullptr, nullptr,
@@ -130,7 +142,10 @@ void KVCache::attention_kvhead_(const uint16_t* q_in_data, ggml_fp16_t* output, 
                                          thread_local_draft_[thread_id].data(), nullptr, cos_.data(), sin_.data());
             dequantize_row_q8_0(thread_local_output_q8_0_[thread_id].data(),
                                 thread_local_output_fp32_[thread_id].data(), n_gqa_ * config_.head_dim);
-          } else if (config_.kv_type == ggml_type::GGML_TYPE_Q8_0) {
+          } 
+          
+          // 忽略
+          else if (config_.kv_type == ggml_type::GGML_TYPE_Q8_0) {
             attn_with_kvcache_one_block_(config_.head_dim, config_.q_head_num / config_.kv_head_num, GGML_TYPE_Q8_0,
                                          q_q8_0_[batch_id][head_id].data(), seq_len_, 0, true, nullptr, GGML_TYPE_Q8_0,
                                          0, k_cache_q8[layer_id_][head_id][block_idx].data(), 0, nullptr, nullptr,
