@@ -527,13 +527,22 @@ void KVCache::attn(const ggml_fp16_t* q_in, ggml_fp16_t* output, float* attn_lse
   quantize_q_(q_in_data, batch_size);
   if (config_.retrieval_type == RetrievalType::LAYER) {
     attn_initialize_layer_(batch_size, layer_idx, block_table, max_block_num, cache_seqlens);
+    // 生成或复用本次 Attention 要遍历的物理 block 表，供紧随其后的 attention_layer_() 使用。
     retrieval_kvcache_layer_(q_in_data, init_block_num, local_block_num, pick_block_num, q_len, generate_token_idx,
                              batch_size, layer_idx, cache_seqlens, max_block_num, backend);
     attention_layer_(q_in_data, output, attn_lse, batch_size, backend);
   } else if (config_.retrieval_type == RetrievalType::KVHEAD) {
+    // 初始化每个 KV head 的完整物理 block 映射、序列长度和相似度缓冲区，为按 KV head 独立检索做准备。
     attn_initialize_kvhead_(batch_size, layer_idx, block_table, max_block_num, cache_seqlens);
+
+    // 为每个 KV head 独立选择或复用相关的 Top-K block，生成后续 Attention 实际遍历的稀疏 block 表。
+
+    // 这段函数不用看，产出是：block_table_after_retrieval_kvhead_
     retrieval_kvcache_kvhead_(q_in_data, init_block_num, local_block_num, pick_block_num, q_len, generate_token_idx,
                               batch_size, layer_idx, cache_seqlens, max_block_num, backend);
+    
+
+    // 在每个 KV head 选出的 block 上执行 QK、Softmax 和 PV，并将各 block 的结果合并为最终 Attention 输出。                          
     attention_kvhead_(q_in_data, output, attn_lse, batch_size, backend);
   }
 
@@ -697,22 +706,34 @@ void KVCache::attn_initialize_layer_(int batch_size, int layer_idx, int* block_t
 }
 
 /**
- * @brief 为 layer 共享的 Top-K 检索计算候选 block 与 Q 的相似度。
+ * @brief 检索阶段第一步：使用 Query 和 Anchor 为每个候选 KV block 计算近似相关度。
  *
- * 开头和 local window block 会被无条件保留，因此不参与打分。候选分数由预计算 block anchor 近似。
- * 常见的单 batch、单 anchor 路径对连续 anchor 执行一次 SGEMM；通用路径逐维取多个 anchor 的最大乘积，
- * 再跨 Query heads 求和。
+ * 此函数只负责“打分”，不选择 block，也不读取完整 K/V 做 Attention。输入的
+ * block_table_before_retrieval_[batch][logical_block] 保存逻辑 block 到物理 block 的映射；函数根据该映射
+ * 找到 anchor_[layer][physical_block][anchor][query_head][dim]，并把结果写入
+ * block_similar_[batch][logical_block]。
  *
- * @param q_in_data FP16 Query，形状为 [batch_size, q_len, q_head_num, head_dim]。
- * @param batch_size 要打分的序列数量。
- * @param layer_idx 要读取 anchor 的模型层。
- * @param q_len 用于计算平均 Query 的 token 数。
- * @param max_block_num 输入 block 表宽度。
- * @param cache_seqlens 调用方序列长度；保留该参数以统一接口，实际边界使用内部副本。
- * @param init_block_num 不参与打分的开头 block 数。
- * @param local_block_num 不参与打分的尾部完整 block 数。
- * @param pick_block_num 目标 Top-K 数；真正选择由 select_block_layer_() 完成。
- * @param backend 用于并行执行 SGEMM 或逐 block 打分的工作线程池。
+ * prefix 区间 [0, init_block_num) 和最近的 local_block_num 个完整 block 会被无条件保留，因此不参与打分；
+ * 未填满的尾 block 也不参与打分。对于其余中间 block，先对 q_len 个 Query token 求平均，再近似计算：
+ *
+ *   score(block) = sum_{query_head, dim}
+ *                    max_{anchor_id}(mean_q[query_head, dim] * anchor[block, anchor_id, query_head, dim])
+ *
+ * batch_size == 1、anchor_num == 1 且候选物理 block 连续时，将所有 Anchor 视为矩阵并调用一次
+ * llamafile_sgemm()；否则通过 WorkerPool 按 (batch, logical_block) 并行逐个打分。函数结束后完整 block 表
+ * 保持不变，后续 select_block_layer_() 才会根据 block_similar_ 构造稀疏 block 表。
+ *
+ * @param q_in_data FP16 Query，布局为 [batch_size, q_len, q_head_num, head_dim]。
+ * @param batch_size 要计算检索分数的序列数量。
+ * @param layer_idx Anchor 所属的模型层编号。
+ * @param q_len 每个序列包含的 Query token 数；大于 1 时先沿该维度求平均。
+ * @param max_block_num block_table_before_retrieval_ 每个 batch 的表宽，也是并行遍历上限。
+ * @param cache_seqlens 调用方传入的序列长度；当前实现保留此参数以统一接口，候选边界实际读取
+ *                      cache_seqlens_ 内部副本。
+ * @param init_block_num 无条件保留、不参与打分的最早完整 block 数。
+ * @param local_block_num 无条件保留、不参与打分的最近完整 block 数。
+ * @param pick_block_num 中间候选区最终希望保留的 Top-K 数；本函数不直接使用它做选择。
+ * @param backend 工作线程池，用于并行执行 llamafile SGEMM 或逐 block 打分任务。
  */
 void KVCache::calculate_block_similarity_layer_(const uint16_t* q_in_data, int batch_size, int layer_idx, int q_len,
                                                 int max_block_num, int* cache_seqlens, int init_block_num,
@@ -844,17 +865,25 @@ void KVCache::calculate_block_similarity_layer_(const uint16_t* q_in_data, int b
 }
 
 /**
- * @brief 由 prefix、Top-K、local 和尾块构造 layer 共享的检索后 block 表。
+ * @brief 检索阶段第二步：根据 block_similar_ 选出 Top-K，并构造供 Attention 使用的稀疏物理 block 表。
  *
- * 有界最小堆保留分数最高的中间 block。输出表依次拼接始终保留的 prefix、检索出的中间 block、最近
- * local window，以及存在时尚未填满的尾块；选择结果会保存，供后续层或 decode token 复用。
+ * 此函数读取 calculate_block_similarity_layer_() 写入的分数。对每个 batch，它使用容量为
+ * pick_block_num 的最小堆扫描中间候选区：新候选入堆后若容量超限，就弹出当前最低分，因此最终留下分数
+ * 最高的 K 个物理 block。随后按以下顺序写入 block_table_after_retrieval_[batch][selected_slot]：
  *
- * @param batch_size 要构造 block 表的序列数量。
- * @param layer_idx 用于索引检索历史的模型层。
- * @param max_block_num 原始 block 表宽度。
- * @param init_block_num 始终保留的最早 block 数。
- * @param local_block_num 始终保留的最近完整 block 数。
- * @param pick_block_num 最多保留的已打分中间 block 数。
+ *   [无条件保留的 prefix] + [Top-K 中间 block] + [最近的 local block] + [未填满的尾 block]
+ *
+ * before/after 表中保存的都是 physical_block 编号；选择过程只复制整数索引，不移动或复制实际 K/V 数据。
+ * 如果完整 block 数没有超过保留预算，则直接使用原始完整 block 表，不产生稀疏。选择完成后，函数把
+ * cache_seqlens_ 改写为“选中完整 block 的总长度 + 尾 block 的有效 token 数”，使 attention_layer_() 可以
+ * 把 after 表当作一个逻辑紧凑的序列遍历，并把结果保存到 selected_blocks_history_ 供后续层或 token 复用。
+ *
+ * @param batch_size 要分别构造稀疏 block 表的序列数量。
+ * @param layer_idx 当前模型层编号，用于定位该检索周期对应的 selected_blocks_history_。
+ * @param max_block_num block_table_before_retrieval_ 的原始表宽。
+ * @param init_block_num 无条件放在输出表开头的最早完整 block 数。
+ * @param local_block_num 无条件放在 Top-K 后面的最近完整 block 数。
+ * @param pick_block_num 从中间候选区最多选出的高分 block 数。
  */
 void KVCache::select_block_layer_(int batch_size, int layer_idx, int max_block_num, int init_block_num,
                                   int local_block_num, int pick_block_num) {
@@ -868,6 +897,7 @@ void KVCache::select_block_layer_(int batch_size, int layer_idx, int max_block_n
       continue;
     }
 
+    // 扫描中间候选区，用固定容量最小堆保留分数最高的 pick_block_num 个 block。
     for (int block_id = init_block_num; block_id < (cache_seqlens_[batch_idx] / config_.block_len) - local_block_num;
          block_id++) {
       top_similar_block_[batch_idx].push(
@@ -877,6 +907,7 @@ void KVCache::select_block_layer_(int batch_size, int layer_idx, int max_block_n
       }
     }
 
+    // after 表的 selected_slot 从 0 开始，依次写入 prefix、Top-K、local 和可选尾 block。
     int i = 0;
     for (; i < init_block_num; i++) {
       block_table_after_retrieval_[batch_idx][i] = block_table_before_retrieval_[batch_idx][i];
@@ -914,23 +945,35 @@ void KVCache::select_block_layer_(int batch_size, int layer_idx, int max_block_n
 }
 
 /**
- * @brief 选择或复用将参与精确 Attention 的 layer 共享 KV block。
+ * @brief 稀疏检索总控：决定复用历史、重新执行 Top-K，还是关闭稀疏并使用全部 block。
  *
- * 在配置的刷新层和 decode 步，函数为候选 block 打分并选择 prefix + Top-K + local + 尾块；两次刷新
- * 之间直接恢复历史选择，并处理新出现的尾块。pick_block_num 为 -1 时跳过检索，转发完整输入 block
- * 表以执行 dense Attention。
+ * attn() 完成 Query 准备和 before 表初始化后调用此函数。函数最终必须设置两个结果：
+ * max_block_num_after_retrieval_ 表示 Attention 要遍历多少个 selected slot，
+ * block_table_after_retrieval_ 保存每个 selected slot 对应的 physical_block 编号。
  *
- * @param q_in_data 需要刷新检索结果时用于打分的 FP16 Query。
- * @param init_block_num 始终保留的开头 block 数。
- * @param local_block_num 始终保留的最近完整 block 数。
- * @param pick_block_num 相似中间 block 预算；-1 表示关闭稀疏检索。
- * @param q_len 相似度计算使用的 Query token 数。
- * @param generate_token_idx 与 config_.token_step 配合使用的 decode token 编号。
- * @param batch_size 序列数量。
- * @param layer_idx 与 config_.layer_step 配合并用于保存历史的当前层编号。
- * @param cache_seqlens 调用方有效 token 数，用于检测新创建的尾块。
- * @param max_block_num 输入/输出可用 block 表宽度。
- * @param backend 刷新分数时使用的工作线程池。
+ * 函数有三个互斥分支：
+ *
+ * 1. pick_block_num != -1，但当前 token 或 layer 不在刷新周期：从 selected_blocks_history_ 复用上次结果；
+ *    如果 Decode 刚进入一个新的尾 block，则把这个尾 block 追加到历史和 after 表中。若尚无历史结果，
+ *    本次退化为完整 block 表以保证可计算。
+ * 2. pick_block_num != -1，且 generate_token_idx % token_step == 0、
+ *    layer_idx % layer_step == layer_offset：先调用 calculate_block_similarity_layer_() 给候选打分，再调用
+ *    select_block_layer_() 生成新的 Top-K 稀疏表并保存历史。
+ * 3. pick_block_num == -1：关闭稀疏检索，after 表直接接管完整 before 表，后续执行 dense Attention。
+ *
+ * 此函数本身不执行 QK/Softmax/PV；它只决定 attention_layer_() 随后能够看到哪些物理 KV block。
+ *
+ * @param q_in_data 刷新 Top-K 时用于计算 Anchor 相似度的 FP16 Query。
+ * @param init_block_num 无条件保留的最早完整 block 数。
+ * @param local_block_num 无条件保留的最近完整 block 数。
+ * @param pick_block_num 中间候选区的 Top-K 预算；-1 表示不稀疏、使用完整 block 表。
+ * @param q_len 每个序列参与相似度计算的 Query token 数。
+ * @param generate_token_idx 当前 Decode token 编号，用于判断是否满足 token_step 刷新周期。
+ * @param batch_size 要处理的序列数量。
+ * @param layer_idx 当前模型层编号，用于判断 layer_step/layer_offset 周期并索引检索历史。
+ * @param cache_seqlens 调用方的有效 token 数；复用历史时用于识别是否刚创建新的尾 block。
+ * @param max_block_num 输入时是完整 before 表宽度；函数通过成员 max_block_num_after_retrieval_ 输出选择后的宽度。
+ * @param backend 刷新 Top-K 时供相似度计算使用的工作线程池；历史复用和 dense 分支不调用它计算分数。
  */
 void KVCache::retrieval_kvcache_layer_(const uint16_t* q_in_data, int init_block_num, int local_block_num,
                                        int pick_block_num, int q_len, int generate_token_idx, int batch_size,
@@ -938,6 +981,7 @@ void KVCache::retrieval_kvcache_layer_(const uint16_t* q_in_data, int init_block
   // Timer start
   auto start = std::chrono::high_resolution_clock::now();
   max_block_num_after_retrieval_ = 0;
+  // 非刷新步：优先复用历史选择，避免每个 Decode token、每个 Layer 都重新计算 Anchor 分数。
   if (pick_block_num != -1 &&
       (generate_token_idx % config_.token_step != 0 || (layer_idx % config_.layer_step != config_.layer_offset))) {
     if (selected_blocks_num_history_[(layer_idx - config_.layer_offset) / config_.layer_step] == 0) {
@@ -967,11 +1011,15 @@ void KVCache::retrieval_kvcache_layer_(const uint16_t* q_in_data, int init_block
       }
     }
   } else if (pick_block_num != -1) {
+    // 刷新步：重新计算候选分数，并据此构造新的 prefix + Top-K + local + tail 表。
     max_block_num_after_retrieval_ = std::min(max_block_num, init_block_num + pick_block_num + local_block_num + 1);
+    // 为每个中间候选 block 计算 Query-Anchor 近似相关度，作为下一步 Top-K 选择的排序依据。
     calculate_block_similarity_layer_(q_in_data, batch_size, layer_idx, q_len, max_block_num, cache_seqlens,
                                       init_block_num, local_block_num, pick_block_num, backend);
+    // 根据候选分数选出 Top-K，并与 prefix、local、尾 block 拼成 Attention 使用的稀疏 block 表。
     select_block_layer_(batch_size, layer_idx, max_block_num, init_block_num, local_block_num, pick_block_num);
   } else {
+    // Dense 模式：不筛选 block，Attention 直接遍历完整输入表。
     selected_blocks_num_history_[(layer_idx - config_.layer_offset) / config_.layer_step] = 0;
     max_block_num_after_retrieval_ = max_block_num;
     block_table_after_retrieval_.swap(block_table_before_retrieval_);
@@ -1237,6 +1285,8 @@ void KVCache::attn_initialize_kvhead_(int batch_size, int layer_idx, int* block_
                                       int* cache_seqlens) {
   // Timer start
   auto start = std::chrono::high_resolution_clock::now();
+
+  // 对于每个batch，把output和attn_lse_初始化为0
   for (int batch_idx = 0; batch_idx < batch_size; batch_idx++) {
     // initialize output_fp32_ and attn_lse_
     for (int i = 0; i < config_.kv_head_num; i++) {
@@ -1775,6 +1825,7 @@ void KVCache::get_attn_sparsity(const ggml_fp16_t* q_in, float* attn_sparsity, i
   quantize_q_(q_in_data, batch_size);
   if (config_.retrieval_type == RetrievalType::LAYER) {
     attn_initialize_layer_(batch_size, layer_idx, block_table, max_block_num, cache_seqlens);
+    // 先生成与真实 Layer Attention 相同的稀疏 block 集合，供后续 calculate_sparsity_layer_() 评估保留质量。
     retrieval_kvcache_layer_(q_in_data, 1, local, topk, q_len, generate_token_idx, batch_size, layer_idx, cache_seqlens,
                              max_block_num, backend);
     calculate_sparsity_layer_(q_in_data, attn_sparsity, batch_size, max_block_num_origin, block_table_origin,

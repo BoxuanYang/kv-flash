@@ -274,6 +274,8 @@ void KVCache::BatchResize(int batch_size) {
 
 /**
  * @brief 调整全部按物理 block 索引的 KV、anchor 辅助状态和检索缓冲区。
+ * 
+ * 初始化KV Cache
  *
  * 函数分配 RoPE 表、历史选择、每层每 KV head 的 FP16/Q4_0/Q8_0 K/V block、每个 token 的 importance、
  * similarity 和逻辑 block 表。K 使用 token-major 布局，V 使用适合 PV GEMM 的 [head_dim, block_len] 转置
@@ -306,14 +308,20 @@ void KVCache::BlockResize(int max_block_num) {
   for (int layer_id = 0; layer_id < config_.layer_num; layer_id++) {
     importance_[layer_id].resize(max_block_num);
 
+    // 这是 KVCache CPU 内存 buffer 的实际分配位置。每个 [layer][kv_head][physical_block] 都拥有一段
+    // 独立连续的 block_data；K 按 [token][head_dim] 排列，V 按 [head_dim][token] 转置排列。
     if (config_.kv_type == ggml_type::GGML_TYPE_F16) {
       // TODO: Elegant implement
+      
+      // 初始化该层
       k_cache_fp16_[layer_id].resize(config_.kv_head_num);
       v_cache_fp16_[layer_id].resize(config_.kv_head_num);
 
+      // 对于一层的KVCache, 每一个KV Head分配max_block_num个块
       for (int i = 0; i < config_.kv_head_num; i++) {
         k_cache_fp16_[layer_id][i].resize(max_block_num);
         v_cache_fp16_[layer_id][i].resize(max_block_num);
+
 
         for (int j = 0; j < max_block_num; j++) {
           k_cache_fp16_[layer_id][i][j].resize(config_.block_len * config_.head_dim);
@@ -348,6 +356,9 @@ void KVCache::BlockResize(int max_block_num) {
     } else {
       assert(false);
     }
+
+    // 分配KVCache结束
+    
     for (int i = 0; i < config_.max_batch_size; i++) {
       if (config_.retrieval_type == RetrievalType::LAYER) {
         block_similar_[i].resize(max_block_num);

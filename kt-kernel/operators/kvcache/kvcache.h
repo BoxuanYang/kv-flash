@@ -1,11 +1,11 @@
 /**
- * @Description  :
- * @Author       : Jianwei Dong
- * @Date         : 2024-08-26 22:47:06
- * @Version      : 1.0.0
- * @LastEditors  : Jianwei Dong
- * @LastEditTime : 2024-08-26 22:47:06
- * @Copyright (c) 2024 by KVCache.AI, All Rights Reserved.
+ * @说明         :
+ * @作者         : Jianwei Dong
+ * @日期         : 2024-08-26 22:47:06
+ * @版本         : 1.0.0
+ * @最后编辑者   : Jianwei Dong
+ * @最后编辑时间 : 2024-08-26 22:47:06
+ * @版权所有 (c) 2024 KVCache.AI，保留所有权利。
  **/
 
 #ifndef CPUINFER_OPERATOR_KVCACHE_H
@@ -29,136 +29,123 @@
 #define CHUNK_SIZE 32
 
 /**
- * @brief Converts a ggml_type enum value to its corresponding string
- * representation.
+ * @brief 将 ggml_type 枚举值转换为对应的字符串表示。
  *
- * This function provides a human-readable string representation for a given
- * ggml_type enum value. The string can be used for logging, debugging, or
- * displaying information in a user interface.
+ * 此函数为给定的 ggml_type 枚举值提供便于阅读的字符串表示，可用于日志记录、
+ * 调试或在用户界面中显示信息。
  *
- * @param type The ggml_type enum value to convert.
- * @return A string representation of the enum value.
+ * @param type 要转换的 ggml_type 枚举值。
+ * @return 枚举值对应的字符串表示。
  */
 std::string ggml_type_to_string(ggml_type type);
 
 /**
  * @enum AnchorType
- * @brief Defines the types of anchors used in attention mechanisms.
+ * @brief 定义 Attention 机制使用的锚点类型。
  *
- * This enum specifies different types of anchors that can be used in attention
- * mechanisms, such as fixed anchors, dynamic anchors, or special anchors like
- * QUEST, BLOCK_MEAN, or BLOCK_MAX.
+ * 此枚举指定 Attention 机制可使用的不同锚点类型，包括固定锚点、动态锚点，
+ * 以及 QUEST、BLOCK_MEAN、BLOCK_MAX 等特殊锚点。
  */
 enum AnchorType {
-  FIXED_ANCHOR, /**< A fixed anchor that does not change. */
-  DYNAMIC,      /**< A dynamic anchor that can change over time. */
-  QUEST,        /**< A special anchor type used for QUEST (Query and Embedding Space
-                   Transformation). */
-  BLOCK_MEAN,   /**< An anchor based on the mean of a block of data. */
-  BLOCK_MAX     /**< An anchor based on the maximum value within a block of data.
+  FIXED_ANCHOR, /**< 始终不变的固定锚点。 */
+  DYNAMIC,      /**< 可随时间变化的动态锚点。 */
+  QUEST,        /**< QUEST（查询与嵌入空间变换）使用的特殊锚点类型。 */
+  BLOCK_MEAN,   /**< 根据一个数据块的均值生成的锚点。 */
+  BLOCK_MAX     /**< 根据一个数据块内最大值生成的锚点。
                  */
 };
 
 /**
- * @brief Converts an AnchorType enum value to its corresponding string
- * representation.
+ * @brief 将 AnchorType 枚举值转换为对应的字符串表示。
  *
- * This function provides a human-readable string representation for a given
- * AnchorType enum value. The string can be used for logging, debugging, or
- * displaying information in a user interface.
+ * 此函数为给定的 AnchorType 枚举值提供便于阅读的字符串表示，可用于日志记录、
+ * 调试或在用户界面中显示信息。
  *
- * @param anchor_type The AnchorType enum value to convert.
- * @return A string representation of the enum value.
+ * @param anchor_type 要转换的 AnchorType 枚举值。
+ * @return 枚举值对应的字符串表示。
  */
 std::string AnchorTypeToString(AnchorType anchor_type);
 
 /**
  * @enum RetrievalType
- * @brief Defines the types of retrieval strategies in attention mechanisms.
+ * @brief 定义 Attention 机制中的检索策略类型。
  *
- * This enum specifies different retrieval strategies that can be used in
- * attention mechanisms, such as layer-level retrieval, key-value head-level
- * retrieval, or query head-level retrieval.
+ * 此枚举指定 Attention 机制可使用的不同检索策略，包括层级检索、KV Head 级检索
+ * 和 Query Head 级检索。
  */
 enum RetrievalType {
-  LAYER,  /**< Retrieval at the layer level. */
-  KVHEAD, /**< Retrieval at the key-value head level. */
-  QHEAD   /**< Retrieval at the query head level. */
+  LAYER,  /**< 按层检索。 */
+  KVHEAD, /**< 按 KV Head 检索。 */
+  QHEAD   /**< 按 Query Head 检索。 */
 };
 
 /**
- * @brief Converts a RetrievalType enum value to its corresponding string
- * representation.
+ * @brief 将 RetrievalType 枚举值转换为对应的字符串表示。
  *
- * This function provides a human-readable string representation for a given
- * RetrievalType enum value. The string can be used for logging, debugging, or
- * displaying information in a user interface.
+ * 此函数为给定的 RetrievalType 枚举值提供便于阅读的字符串表示，可用于日志记录、
+ * 调试或在用户界面中显示信息。
  *
- * @param retrieval_type The RetrievalType enum value to convert.
- * @return A string representation of the enum value.
+ * @param retrieval_type 要转换的 RetrievalType 枚举值。
+ * @return 枚举值对应的字符串表示。
  */
 std::string RetrievalTypeToString(RetrievalType retrieval_type);
 
 /**
  * @struct KVCacheConfig
- * @brief Configuration structure for Key-Value (KV) Cache.
+ * @brief KV Cache 的配置结构体。
  *
- * This structure holds configuration parameters for setting up and managing
- * a Key-Value (KV) Cache used in various attention mechanisms. It includes
- * parameters such as the number of layers, the number of heads, the dimension
- * of each head, block length, anchor information, and memory-related settings.
+ * 此结构体保存创建和管理 Attention 机制所用 KV Cache 的配置参数，包括层数、
+ * Head 数、每个 Head 的维度、Block 长度、锚点信息以及内存相关设置。
  */
 struct KVCacheConfig {
-  int layer_num;   /**< Number of layers in the model. */
-  int kv_head_num; /**< Number of heads in the KV Cache. */
-  int q_head_num;  /**< Number of heads in the query. */
-  int head_dim;    /**< Dimension of each head. */
-  int block_len;   /**< Length of each block in the cache. */
-  int anchor_num;  /**< Number of anchors used in attention. */
+  int layer_num;   /**< 模型的层数。 */
+  int kv_head_num; /**< KV Cache 中的 Head 数。 */
+  int q_head_num;  /**< Query 的 Head 数。 */
+  int head_dim;    /**< 每个 Head 的维度。 */
+  int block_len;   /**< Cache 中每个 Block 的长度。 */
+  int anchor_num;  /**< Attention 使用的锚点数量。 */
 
-  ggml_type kv_type; /**< Data type of the KV Cache (e.g., fp16, q8_0). */
+  ggml_type kv_type; /**< KV Cache 的数据类型，例如 fp16、q8_0。 */
 
-  // Controls the pre-allocated memory size
-  int max_block_num;  /**< Maximum number of blocks that can be allocated. */
-  int max_batch_size; /**< Maximum batch size that can be processed. */
-  int max_thread_num; /**< Maximum number of threads that can be used. */
+  // 控制预分配内存的大小
+  int max_block_num;  /**< 可分配的最大 Block 数量。 */
+  int max_batch_size; /**< 可处理的最大 Batch Size。 */
+  int max_thread_num; /**< 可使用的最大线程数。 */
 
-  AnchorType anchor_type;       /**< Type of anchors used in the attention mechanism. */
-  RetrievalType retrieval_type; /**< Type of retrieval strategy used in the cache. */
+  AnchorType anchor_type;       /**< Attention 机制使用的锚点类型。 */
+  RetrievalType retrieval_type; /**< Cache 使用的检索策略类型。 */
 
-  int layer_step;   /**< Step size between layers. */
-  int token_step;   /**< Step size between tokens. */
-  int layer_offset; /**< Offset value for layers. */
+  int layer_step;   /**< 层之间的步长。 */
+  int token_step;   /**< Token 之间的步长。 */
+  int layer_offset; /**< 层偏移量。 */
 
   /**
-   * @brief Default constructor for KVCacheConfig.
+   * @brief KVCacheConfig 的默认构造函数。
    *
-   * Initializes the configuration with default values. This constructor
-   * does not initialize any member variables explicitly.
+   * 使用默认值初始化配置。此构造函数不显式初始化任何成员变量。
    */
   KVCacheConfig() = default;
 
   /**
-   * @brief Parameterized constructor for KVCacheConfig.
+   * @brief KVCacheConfig 的带参构造函数。
    *
-   * This constructor initializes the configuration with specific values
-   * for all member variables.
+   * 使用指定值初始化全部成员变量。
    *
-   * @param layer_num The number of layers in the model.
-   * @param kv_head_num The number of heads in the KV Cache.
-   * @param q_head_num The number of heads in the query.
-   * @param head_dim The dimension of each head.
-   * @param block_len The length of each block in the cache.
-   * @param anchor_num The number of anchors used in attention.
-   * @param anchor_type The type of anchors used in the attention mechanism.
-   * @param kv_type The data type of the KV Cache (e.g., fp16, q8_0).
-   * @param retrieval_type The type of retrieval strategy used in the cache.
-   * @param layer_step The step size between layers.
-   * @param token_step The step size between tokens.
-   * @param layer_offset The offset value for layers.
-   * @param max_block_num The maximum number of blocks that can be allocated.
-   * @param max_batch_size The maximum batch size that can be processed.
-   * @param max_thread_num The maximum number of threads that can be used.
+   * @param layer_num 模型的层数。
+   * @param kv_head_num KV Cache 中的 Head 数。
+   * @param q_head_num Query 的 Head 数。
+   * @param head_dim 每个 Head 的维度。
+   * @param block_len Cache 中每个 Block 的长度。
+   * @param anchor_num Attention 使用的锚点数量。
+   * @param anchor_type Attention 机制使用的锚点类型。
+   * @param kv_type KV Cache 的数据类型，例如 fp16、q8_0。
+   * @param retrieval_type Cache 使用的检索策略类型。
+   * @param layer_step 层之间的步长。
+   * @param token_step Token 之间的步长。
+   * @param layer_offset 层偏移量。
+   * @param max_block_num 可分配的最大 Block 数量。
+   * @param max_batch_size 可处理的最大 Batch Size。
+   * @param max_thread_num 可使用的最大线程数。
    */
   KVCacheConfig(int layer_num, int kv_head_num, int q_head_num, int head_dim, int block_len, int anchor_num,
                 AnchorType anchor_type, ggml_type kv_type, RetrievalType retrieval_type, int layer_step, int token_step,
@@ -167,136 +154,124 @@ struct KVCacheConfig {
 
 /**
  * @class KVCache
- * @brief Manages the Key-Value (KV) Cache used in attention mechanisms.
+ * @brief 管理 Attention 机制使用的 KV Cache。
  *
- * The KVCache class provides functionality for managing the Key-Value Cache,
- * including resizing the cache, retrieving configuration parameters, and
- * updating internal states. This class is typically used in transformer models
- * to store and manage past key and value states for efficient attention
- * computations.
+ * KVCache 类提供管理 KV Cache 的功能，包括调整 Cache 大小、读取配置参数以及
+ * 更新内部状态。该类通常用于 Transformer 模型，存储并管理历史 Key、Value 状态，
+ * 以便高效计算 Attention。
  */
 class KVCache {
  public:
   /**
-   * @brief Constructs a KVCache object with the given configuration.
+   * @brief 使用给定配置构造 KVCache 对象。
    *
-   * Initializes the KVCache with the specified configuration parameters,
-   * such as the number of layers, heads, head dimensions, and other
-   * relevant settings.
+   * 使用指定配置参数初始化 KVCache，包括层数、Head 数、Head 维度及其他相关设置。
    *
-   * @param config The configuration object containing initialization
-   * parameters.
+   * @param config 包含各项初始化参数的配置对象。
    */
   KVCache(KVCacheConfig config);
 
   /**
-   * @brief Resizes the number of threads used by the cache.
+   * @brief 调整 Cache 使用的线程数。
    *
-   * This function adjusts the number of threads that the cache can utilize.
-   * It allows dynamic reconfiguration of the parallel processing capabilities
-   * based on the current workload or system resources.
+   * 调整 Cache 可使用的线程数量，从而根据当前工作负载或系统资源动态配置并行处理能力。
    *
-   * @param thread_num The new number of threads to use.
+   * @param thread_num 调整后的线程数。
    */
   void ThreadResize(int thread_num);
 
   /**
-   * @brief Resizes the batch size managed by the cache.
+   * @brief 调整 Cache 管理的 Batch Size。
    *
-   * This function adjusts the batch size that the cache can handle. It
-   * is useful when the input batch size changes dynamically, allowing
-   * the cache to be reconfigured accordingly.
+   * 调整 Cache 可处理的 Batch Size。当输入 Batch Size 动态变化时，可用此函数
+   * 相应地重新配置 Cache。
    *
-   * @param batch_size The new batch size.
+   * @param batch_size 调整后的 Batch Size。
    */
   void BatchResize(int batch_size);
 
   /**
-   * @brief Resizes the number of blocks managed by the cache.
+   * @brief 调整 Cache 管理的 Block 数量。
    *
-   * This function adjusts the number of blocks that the cache can manage.
-   * It allows dynamic reconfiguration of the block structure based on the
-   * current sequence length or other factors.
+   * 调整 Cache 可管理的 Block 数量，从而根据当前序列长度或其他因素动态配置
+   * Block 结构。
    *
-   * @param block_num The new number of blocks.
+   * @param block_num 调整后的 Block 数量。
    */
   void BlockResize(int block_num);
 
   /**
-   * @brief Gets the number of layers in the cache.
+   * @brief 获取 Cache 的层数。
    *
-   * @return The number of layers configured in the cache.
+   * @return Cache 配置的层数。
    */
   int get_layer_num() { return config_.layer_num; }
 
   /**
-   * @brief Gets the number of KV heads in the cache.
+   * @brief 获取 Cache 的 KV Head 数量。
    *
-   * @return The number of KV heads configured in the cache.
+   * @return Cache 配置的 KV Head 数量。
    */
   int get_kv_head_num() { return config_.kv_head_num; }
 
   /**
-   * @brief Gets the number of query heads in the cache.
+   * @brief 获取 Cache 的 Query Head 数量。
    *
-   * @return The number of query heads configured in the cache.
+   * @return Cache 配置的 Query Head 数量。
    */
   int get_q_head_num() { return config_.q_head_num; }
 
   /**
-   * @brief Gets the dimension of each head in the cache.
+   * @brief 获取 Cache 中每个 Head 的维度。
    *
-   * @return The dimension of each head.
+   * @return 每个 Head 的维度。
    */
   int get_head_dim() { return config_.head_dim; }
 
   /**
-   * @brief Gets the length of each block in the cache.
+   * @brief 获取 Cache 中每个 Block 的长度。
    *
-   * @return The length of each block.
+   * @return 每个 Block 的长度。
    */
   int get_block_len() { return config_.block_len; }
 
   /**
-   * @brief Gets the number of blocks for a specific layer.
+   * @brief 获取指定层的 Block 数量。
    *
-   * @param layer_id The ID of the layer for which to retrieve the block
-   * number.
-   * @return The number of blocks in the specified layer.
+   * @param layer_id 要查询 Block 数量的层 ID。
+   * @return 指定层中的 Block 数量。
    */
   int get_block_num(int layer_id) { return past_block_num_[layer_id]; }
 
   /**
-   * @brief Gets the number of anchors in the cache.
+   * @brief 获取 Cache 中的锚点数量。
    *
-   * @return The number of anchors configured in the cache.
+   * @return Cache 配置的锚点数量。
    */
   int get_anchor_num() { return config_.anchor_num; }
 
   /**
-   * @brief Gets the total length of the cache.
+   * @brief 获取 Cache 的总长度。
    *
-   * @return The total length of the cache.
+   * @return Cache 的总长度。
    */
   int get_cache_total_len() { return cache_total_len_; }
 
   /**
-   * @brief Gets the total number of blocks in the cache.
+   * @brief 获取 Cache 中的 Block 总数。
    *
-   * This function computes and returns the total number of blocks in the
-   * cache based on the total cache length and the block length configuration.
+   * 根据 Cache 总长度和 Block 长度配置计算并返回 Cache 中的 Block 总数。
    *
-   * @return The total number of blocks in the cache.
+   * @return Cache 中的 Block 总数。
    */
   int get_cache_total_block_num() { return (cache_total_len_ + config_.block_len - 1) / config_.block_len; }
 
   /**
-   * @brief Updates the total length of the cache.
+   * @brief 更新 Cache 的总长度。
    *
-   * This function sets a new total length for the cache, allowing dynamic
-   * adjustment of the cache size during runtime.
+   * 为 Cache 设置新的总长度，以便在运行时动态调整 Cache 大小。
    *
-   * @param cache_total_len The new total length of the cache.
+   * @param cache_total_len Cache 的新总长度。
    */
   void update_cache_total_len(int cache_total_len) { cache_total_len_ = cache_total_len; }
   void attn(const ggml_fp16_t* q_in, ggml_fp16_t* output, float* attn_lse, int layer_idx, int generate_token_idx,
@@ -355,30 +330,37 @@ class KVCache {
   void get_all_kvcache_one_layer(int layer_id, ggml_fp16_t* k_in, ggml_fp16_t* v_in, WorkerPool* backend);
 
  private:
-  // Persistent data
+  // 持久化数据
   KVCacheConfig config_;
   int n_gqa_;                             // q_head_num / kv_head_num
-  int cache_total_len_;                   // Number of tokens in cache
+  int cache_total_len_;                   // Cache 中的 Token 数量
   std::vector<uint64_t> past_block_num_;  // [layer_num]
+
+  // 这是 KVCache 在 CPU 内存中的持久化 buffer。
+  // 外层使用四级 vector，统一索引为 [layer][kv_head][physical_block][block_data]；因此每个物理 block 的
+  // block_data 连续，但不同 block、KV head 和 layer 之间不保证物理连续。
+  //
+  // K block 采用 token-major 布局：
+  //   FP16: K[token, dim] -> token * head_dim + dim
+  //   Q4/Q8: K[token, dim_group] -> token * (head_dim / 32) + dim_group
+  // V block 为了让 Attention probability x V 使用连续内存，采用转置后的 channel-major 布局：
+  //   FP16: V[dim, token] -> dim * block_len + token
+  //   Q4/Q8: V[dim, token_group] -> dim * (block_len / 32) + token_group
+  // 其中一个 block_q4_0/block_q8_0 表示连续 32 个元素。逻辑 token block 通过 block_table 映射到
+  // physical_block；未量化时每个 K/V block 都包含 block_len * head_dim 个 FP16 元素。
   std::vector<std::vector<std::vector<std::vector<block_q4_0>>>>
-      k_cache_q4;  // [layer_num, kv_head_num, past_block_num,
-                   // block_len * (head_dim / QK_4)]
+      k_cache_q4;  // [layer_num][kv_head_num][physical_block][block_len * (head_dim / 32)]
   std::vector<std::vector<std::vector<std::vector<block_q4_0>>>>
-      v_cache_q4;  // [layer_num, kv_head_num, past_block_num,
-                   // head_dim * (block_len / QK_4)]
+      v_cache_q4;  // [layer_num][kv_head_num][physical_block][head_dim * (block_len / 32)]
   std::vector<std::vector<std::vector<std::vector<block_q8_0>>>>
-      k_cache_q8;  // [layer_num, kv_head_num, past_block_num,
-                   // block_len * (head_dim / QK_8)]
+      k_cache_q8;  // [layer_num][kv_head_num][physical_block][block_len * (head_dim / 32)]
   std::vector<std::vector<std::vector<std::vector<block_q8_0>>>>
-      v_cache_q8;  // [layer_num, kv_head_num, past_block_num,
-                   // head_dim * (block_len / QK_8)]
+      v_cache_q8;  // [layer_num][kv_head_num][physical_block][head_dim * (block_len / 32)]
 
   std::vector<std::vector<std::vector<std::vector<ggml_fp16_t>>>>
-      k_cache_fp16_;  // [layer_num, kv_head_num, past_block_num, block_len *
-                      // head_dim]
+      k_cache_fp16_;  // [layer_num][kv_head_num][physical_block][block_len * head_dim]
   std::vector<std::vector<std::vector<std::vector<ggml_fp16_t>>>>
-      v_cache_fp16_;  // [layer_num, kv_head_num, past_block_num, head_dim *
-                      // block_len]
+      v_cache_fp16_;  // [layer_num][kv_head_num][physical_block][head_dim * block_len]
 
   std::vector<std::vector<std::vector<std::vector<ggml_fp16_t>>>> importance_;  // [layer_num, past_block_num,
                                                                                 // block_len, attention_head_num]
@@ -386,18 +368,18 @@ class KVCache {
   std::vector<ggml_fp16_t> anchor_;  // [layer_num * past_block_num * anchor_num *
                                      // attention_head_num * head_dim]
 
-  // Runtime data
+  // 运行时数据
   int64_t layer_id_;
   int64_t block_idx_;
   int* block_table_;
   uint64_t block_num_;
   int max_block_num_after_retrieval_;
 
-  // Rotary positional embeddings
+  // 旋转位置编码
   std::vector<std::vector<ggml_fp16_t>> sin_;  // [seq_len, head_dim]
   std::vector<std::vector<ggml_fp16_t>> cos_;  // [seq_len, head_dim]
 
-  // update/get
+  // 更新与读取
   int seq_len_;
   uint16_t* k_scales_;         // q4_0
   uint8_t* k_in_;              // q4_0
@@ -408,11 +390,11 @@ class KVCache {
   uint16_t* importance_data_;  // fp16
   uint16_t* anchor_data_;      // fp16
 
-  // sparsity = (sigma(block lse / lse))
+  // 稀疏度 = (sigma(block lse / lse))
   std::vector<std::vector<std::vector<float>>> block_lse_;  // [batch_size, max_block_num, q_head_num]
   std::vector<std::vector<float>> attn_sparsity_;           // [batch_size, q_head_num]
 
-  // attn
+  // Attention 运行时数据
   std::vector<std::vector<float>> avg_q;  // [batch_size, q_head_num * head_dim]
 
   std::vector<std::vector<ggml_fp16_t>> avg_q_fp16;  // [batch_size, q_head_num * head_dim]
@@ -466,7 +448,7 @@ class KVCache {
   std::vector<std::vector<char>> thread_local_draft_;              // [thread_num, 2 * n_gqa * block_len + 6 * n_gqa *
                                                                    // head_dim + 2 * block_len * head_dim]
 
-  // tmp space
+  // 临时空间
   std::vector<float> q_fp32;  // [n_gqa * head_dim]
 
   void quantize_q_(const uint16_t* q_in_data, int batch_size);
@@ -502,112 +484,98 @@ class KVCache {
                         WorkerPool* backend);
 
   /**
-   * @brief Computes attention with KV cache for one block.
+   * @brief 使用 KV Cache 计算单个 Block 的 Attention。
    *
-   * This function performs attention computation for one block using KV
-   * cache. The function supports different data types for Q, K, and V caches,
-   * and provides options for quantization. The function does not perform any
-   * dynamic memory allocation internally, so all necessary buffers must be
-   * pre-allocated externally.
+   * 此函数使用 KV Cache 对单个 Block 执行 Attention 计算。函数支持多种 Q、K、V Cache
+   * 数据类型，并提供量化选项。函数内部不执行任何动态内存分配，因此所需 Buffer 必须
+   * 由调用方预先分配。
    *
-   * @param head_dim The dimension of the head.
-   * @param bsz The batch size.
-   * @param q_type The data type of Q (GGML data type). Only supports fp16 and
-   * q8_0.
-   * @param q Pointer to the Q tensor [bsz, head_dim]. The quantization is
-   *          always applied along the head_dim dimension. The size must be
-   *          bsz * head_dim/32 * qtype_size. If head_dim % 32 != 0, an error
-   *          will be raised.
-   * @param past_kv_len The length of the past KV cache.
-   * @param past_kv_offset The offset in the past KV cache.
-   * @param is_full_attn Boolean flag indicating whether to use full attention
-   *                     (true for full 1 mask).
-   * @param attn_mask Pointer to the attention mask [bsz, past_kv_len]. If
-   *                  is_full_attn = false, a bit matrix is passed to
-   * represent the mask.
-   * @param k_type The data type of K cache (GGML data type). Only supports
-   *               fp16, q4_0, and q8_0.
-   * @param k_quant_type Quantization type for K cache. 0 for per_token, 1 for
-   *                     per_channel. Other values will raise an error.
-   * @param k_cache Pointer to the K cache tensor [seq_len, head_dim]. If
-   *                quant_type == 0, head_dim % 32 must be 0. If quant_type ==
-   * 1, seq_len % 32 must be 0.
-   * @param num_k_anchor The number of K anchors. If num_k_anchor == 0, it
-   * means no anchor is present.
-   * @param k_cache_anchors Pointer to the K cache anchors [num_k_anchor,
-   * head_dim]. The k_anchor_type must be fp16.
-   * @param k_cache_anchor_pos Pointer to the K cache anchor positions. Each
-   * token is associated with the nearest previous anchor position.
-   * @param v_type The data type of V cache (GGML data type).
-   * @param v_quant_type Quantization type for V cache.
-   * @param v_cache Pointer to the V cache tensor [head_dim, seq_len].
-   * @param num_v_anchor The number of V anchors.
-   * @param v_cache_anchors Pointer to the V cache anchors.
-   * @param v_cache_anchor_pos Pointer to the V cache anchor positions.
-   * @param attn_score Pre-allocated buffer for attention scores [bsz,
-   * past_kv_len].
-   * @param output Output tensor [bsz, head_dim] with the same type as q_type.
-   * @param lse Pre-allocated buffer [bsz] for the log-sum-exp of the
-   * attention scores.
-   * @param draft Pre-allocated temporary buffer. The buffer size should be
-   * enough to hold (2 * bsz * past_kv_len + 6 * bsz * head_dim + 2 *
-   *              past_kv_len * head_dim + past_kv_len * head_dim / 32) bytes.
-   * @param rotary_angle Pointer to the rotary angle tensor.
-   * @param rotary_cos Pointer to the cosine values for rotary embedding.
-   * @param rotary_sin Pointer to the sine values for rotary embedding.
+   * @param head_dim Head 的维度。
+   * @param bsz Batch Size。
+   * @param q_type Q 的 GGML 数据类型，仅支持 fp16 和 q8_0。
+   * @param q 指向 Q Tensor [bsz, head_dim]。量化始终沿 head_dim 维度进行，大小必须为
+   *          bsz * head_dim/32 * qtype_size；若 head_dim % 32 != 0，则报错。
+   * @param past_kv_len 历史 KV Cache 的长度。
+   * @param past_kv_offset 历史 KV Cache 中的偏移量。
+   * @param is_full_attn 是否使用全量 Attention；true 表示 Mask 全为 1。
+   * @param attn_mask 指向 Attention Mask [bsz, past_kv_len]。若 is_full_attn = false，
+   *                  则传入表示 Mask 的位矩阵。
+   * @param k_type K Cache 的 GGML 数据类型，仅支持 fp16、q4_0 和 q8_0。
+   * @param k_quant_type K Cache 的量化类型：0 表示 per_token，1 表示 per_channel，
+   *                     其他值会报错。
+   * @param k_cache 指向 K Cache Tensor [seq_len, head_dim]。quant_type == 0 时，
+   *                head_dim % 32 必须为 0；quant_type == 1 时，seq_len % 32 必须为 0。
+   * @param num_k_anchor K 锚点数量。num_k_anchor == 0 表示没有锚点。
+   * @param k_cache_anchors 指向 K Cache 锚点 [num_k_anchor, head_dim]，
+   *                        k_anchor_type 必须为 fp16。
+   * @param k_cache_anchor_pos 指向 K Cache 锚点位置。每个 Token 与其前方距离最近的锚点位置关联。
+   * @param v_type V Cache 的 GGML 数据类型。
+   * @param v_quant_type V Cache 的量化类型。
+   * @param v_cache 指向 V Cache Tensor [head_dim, seq_len]。
+   * @param num_v_anchor V 锚点数量。
+   * @param v_cache_anchors 指向 V Cache 锚点。
+   * @param v_cache_anchor_pos 指向 V Cache 锚点位置。
+   * @param attn_score 预分配的 Attention Score Buffer [bsz, past_kv_len]。
+   * @param output 输出 Tensor [bsz, head_dim]，数据类型与 q_type 相同。
+   * @param lse 预分配的 Buffer [bsz]，用于保存 Attention Score 的 log-sum-exp。
+   * @param draft 预分配的临时 Buffer，其容量应至少为
+   *              (2 * bsz * past_kv_len + 6 * bsz * head_dim + 2 *
+   *              past_kv_len * head_dim + past_kv_len * head_dim / 32) 字节。
+   * @param rotary_angle 指向旋转角 Tensor。
+   * @param rotary_cos 指向旋转位置编码的余弦值。
+   * @param rotary_sin 指向旋转位置编码的正弦值。
    */
   void attn_with_kvcache_one_block_(int head_dim, int bsz,
-                                    ggml_type q_type,  // GGML data type of `Q`, only supports fp16 and q8_0
+                                    ggml_type q_type,  // Q 的 GGML 数据类型，仅支持 fp16 和 q8_0
                                     // [bsz, head_dim]
-                                    // Quantization is always on the head_dim dimension (per_token). If
-                                    // head_dim % 32 != 0, an error will be raised. The size must be bsz *
+                                    // 量化始终沿 head_dim 维度进行（per_token）。若 head_dim % 32 != 0，
+                                    // 则报错。大小必须为 bsz *
                                     // head_dim/32 * qtype_size.
                                     const void* q,
 
                                     int past_kv_len, int past_kv_offset,
-                                    bool is_full_attn,  // true indicates a full 1 mask
-                                    // If is_full_attn = false, a bit matrix representing the mask is
-                                    // passed. [bsz, past_kv_len]
+                                    bool is_full_attn,  // true 表示 Mask 全为 1
+                                    // 若 is_full_attn = false，则传入表示 Mask 的位矩阵。
+                                    // [bsz, past_kv_len]
                                     const uint8_t* attn_mask,
 
-                                    ggml_type k_type,  // GGML data type of `K Cache`, only supports fp16,
+                                    ggml_type k_type,  // K Cache 的 GGML 数据类型，仅支持 fp16、
                                                        // q4_0, q8_0
-                                    int k_quant_type,  // 0 for per_token, 1 for per_channel, others raise an
-                                                       // error
+                                    int k_quant_type,  // 0 表示 per_token，1 表示 per_channel，其他值
+                                                       // 会报错
                                     // [seq_len, head_dim]
-                                    // If quant_type == 0, head_dim % 32 must be 0.
-                                    // If quant_type == 1, seq_len % 32 must be 0.
+                                    // quant_type == 0 时，head_dim % 32 必须为 0。
+                                    // quant_type == 1 时，seq_len % 32 必须为 0。
                                     const void* k_cache,
 
-                                    // k_anchor_type must be fp16
-                                    int num_k_anchor,  // num_k_anchor == 0 indicates no anchor
+                                    // k_anchor_type 必须为 fp16
+                                    int num_k_anchor,  // num_k_anchor == 0 表示没有锚点
                                     // [num_k_anchor, head_dim]
                                     const void* k_cache_anchors,
-                                    // Each token is associated with the nearest previous position's anchor,
-                                    // with the same distance.
+                                    // 每个 Token 与其前方距离最近的锚点位置关联，并保持相同距离。
                                     const int* k_cache_anchor_pos,
 
-                                    // v_cache similar to k_cache
+                                    // v_cache 与 k_cache 类似
                                     ggml_type v_type, int v_quant_type,
                                     // [head_dim, seq_len]
                                     const void* v_cache, int num_v_anchor, const void* v_cache_anchors,
                                     const int* v_cache_anchor_pos,
 
-                                    // Pre-allocated buffer for intermediate calculations [bsz,
-                                    // past_kv_len]. No malloc is performed inside this function.
+                                    // 为中间计算预分配的 Buffer [bsz, past_kv_len]；
+                                    // 此函数内部不调用 malloc。
                                     float* attn_score,
 
-                                    // Output: [bsz, head_dim], with the same type as q_type
+                                    // 输出：[bsz, head_dim]，数据类型与 q_type 相同
                                     void* output,
                                     // [bsz]
                                     float* lse,
 
-                                    // Pre-allocated temporary buffer with sufficient size:
+                                    // 预分配且容量足够的临时 Buffer：
                                     // (2 * bsz * past_kv_len + 6 * bsz * head_dim + 2 * past_kv_len *
-                                    // head_dim + past_kv_len * head_dim / 32) bytes.
+                                    // head_dim + past_kv_len * head_dim / 32) 字节。
                                     void* draft,
 
-                                    // Apply rotary embedding online
+                                    // 在线应用旋转位置编码
                                     const int* rotary_angle, const void* rotary_cos, const void* rotary_sin
                                     // rotary_cos=None,
                                     // rotary_sin=None,
@@ -615,24 +583,22 @@ class KVCache {
                                     // cache_batch_idx: Optional[torch.Tensor] = None,
                                     // rotary_interleaved=True,
 
-                                    // // Not supported for now
-                                    // window_size=(-1, -1),  # -1 means infinite context window
+                                    // // 暂不支持
+                                    // window_size=(-1, -1),  # -1 表示无限上下文窗口
                                     // alibi_slopes=None,
   );
 };
 
 /**
- * @brief Scales a float32 vector by a given scalar value.
+ * @brief 使用给定标量缩放 float32 向量。
  *
- * This function multiplies each element of the input vector `y` by a scalar
- * `v`. It uses platform-specific optimizations if available, such as Apple's
- * Accelerate framework or SIMD instructions. If no specific optimization is
- * available, the function falls back to a simple scalar multiplication loop.
+ * 此函数将输入向量 `y` 的每个元素乘以标量 `v`。如果可用，会采用平台专用优化，
+ * 例如 Apple Accelerate 框架或 SIMD 指令；若没有可用的专用优化，则回退到简单的
+ * 标量乘法循环。
  *
- * @param n The number of elements in the vector `y`.
- * @param y The input vector to be scaled. The result will be stored in the same
- * vector.
- * @param v The scalar value by which to scale the vector.
+ * @param n 向量 `y` 中的元素数量。
+ * @param y 要缩放的输入向量，结果写回同一向量。
+ * @param v 用于缩放向量的标量值。
  */
 void ggml_vec_scale_f32(const int n, float* y, const float v);
 #endif
