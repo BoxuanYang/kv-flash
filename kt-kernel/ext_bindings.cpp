@@ -73,6 +73,8 @@ static const bool _is_plain_ = false;
 #include <type_traits>
 
 #include "operators/kvcache/kvcache.h"
+#include "operators/dense_kvcache/dense_kvcache.h"
+#include "operators/dense_kvcache/qwen3_cpu_ops.h"
 #include "operators/llamafile/linear.h"
 #include "operators/llamafile/mla.hpp"
 #include "operators/llamafile/mlp.h"
@@ -983,6 +985,198 @@ PYBIND11_MODULE(kt_kernel_ext, m) {
       .def("get_cache_total_len", &KVCache::get_cache_total_len)
       .def("update_cache_total_len",
            [](KVCache& kvcache, int cache_total_len) { kvcache.update_cache_total_len(cache_total_len); });
+
+  // Dense KVCache 是原 KVCache 删除稀疏和量化分支后的 FP16 全量 GQA Decode 接口。
+  auto dense_kvcache_module = m.def_submodule("dense_kvcache");
+  dense_kvcache_module.def(
+      "rms_norm_fp16",
+      [](uintptr_t input, uintptr_t weight, uintptr_t output, int rows,
+         int hidden_dim, float eps, WorkerPool& backend) {
+        dense::rms_norm_fp16(reinterpret_cast<const ggml_fp16_t*>(input),
+                            reinterpret_cast<const ggml_fp16_t*>(weight),
+                            reinterpret_cast<ggml_fp16_t*>(output), rows,
+                            hidden_dim, eps, &backend);
+      },
+      py::arg("input"), py::arg("weight"), py::arg("output"), py::arg("rows"),
+      py::arg("hidden_dim"), py::arg("eps"), py::arg("backend"),
+      py::call_guard<py::gil_scoped_release>());
+  dense_kvcache_module.def(
+      "qwen3_rope_fp16",
+      [](uintptr_t q, uintptr_t k, uintptr_t position_ids, uintptr_t cos,
+         uintptr_t sin, int batch_size, int q_len, int q_head_num,
+         int kv_head_num, int head_dim, WorkerPool& backend) {
+        dense::qwen3_rope_fp16(
+            reinterpret_cast<ggml_fp16_t*>(q),
+            reinterpret_cast<ggml_fp16_t*>(k),
+            reinterpret_cast<const int*>(position_ids),
+            reinterpret_cast<const ggml_fp16_t*>(cos),
+            reinterpret_cast<const ggml_fp16_t*>(sin), batch_size, q_len,
+            q_head_num, kv_head_num, head_dim, &backend);
+      },
+      py::arg("q"), py::arg("k"), py::arg("position_ids"), py::arg("cos"),
+      py::arg("sin"), py::arg("batch_size"), py::arg("q_len"),
+      py::arg("q_head_num"), py::arg("kv_head_num"), py::arg("head_dim"),
+      py::arg("backend"), py::call_guard<py::gil_scoped_release>());
+  py::class_<dense::KVCacheConfig>(dense_kvcache_module, "KVCacheConfig")
+      .def(py::init<int, int, int, int, int, ggml_type, int, int, int>(),
+           py::arg("layer_num"), py::arg("kv_head_num"), py::arg("q_head_num"), py::arg("head_dim"),
+           py::arg("block_len"), py::arg("kv_type"), py::arg("max_block_num"),
+           py::arg("max_batch_size"), py::arg("max_thread_num"))
+      .def_readwrite("layer_num", &dense::KVCacheConfig::layer_num)
+      .def_readwrite("kv_head_num", &dense::KVCacheConfig::kv_head_num)
+      .def_readwrite("q_head_num", &dense::KVCacheConfig::q_head_num)
+      .def_readwrite("head_dim", &dense::KVCacheConfig::head_dim)
+      .def_readwrite("block_len", &dense::KVCacheConfig::block_len)
+      .def_readwrite("kv_type", &dense::KVCacheConfig::kv_type)
+      .def_readwrite("max_block_num", &dense::KVCacheConfig::max_block_num)
+      .def_readwrite("max_batch_size", &dense::KVCacheConfig::max_batch_size)
+      .def_readwrite("max_thread_num", &dense::KVCacheConfig::max_thread_num);
+  py::class_<dense::KVCache>(dense_kvcache_module, "KVCache")
+      .def(py::init<dense::KVCacheConfig>())
+      .def("get_layer_num", &dense::KVCache::get_layer_num)
+      .def("get_kv_head_num", &dense::KVCache::get_kv_head_num)
+      .def("get_q_head_num", &dense::KVCache::get_q_head_num)
+      .def("get_head_dim", &dense::KVCache::get_head_dim)
+      .def("get_block_len", &dense::KVCache::get_block_len)
+      .def("get_cache_total_len", &dense::KVCache::get_cache_total_len)
+      .def("get_cache_total_block_num", &dense::KVCache::get_cache_total_block_num)
+      .def("update_cache_total_len", &dense::KVCache::update_cache_total_len,
+           py::arg("cache_total_len"))
+      .def("get_block_num", &dense::KVCache::get_block_num)
+      .def("ThreadResize", &dense::KVCache::ThreadResize, py::arg("thread_num"))
+      .def("BatchResize", &dense::KVCache::BatchResize, py::arg("batch_size"))
+      .def("BlockResize", &dense::KVCache::BlockResize, py::arg("block_num"))
+      /*
+       * 这个 binding 为每个 batch 写入一个 Decode K/V。block_table/cache_seqlens 是 CPU int32
+       * 地址，batch_size/max_block_num 描述映射，layer_id 选择层，backend 是线程池。
+       */
+      .def(
+          "update_kvcache_fp16",
+          [](dense::KVCache& cache, uintptr_t k_in, uintptr_t v_in, int layer_id, uintptr_t block_table,
+             int batch_size, int max_block_num, uintptr_t cache_seqlens, int q_len,
+             WorkerPool& backend) {
+            cache.update_kvcache_fp16(reinterpret_cast<const ggml_fp16_t*>(k_in),
+                                      reinterpret_cast<const ggml_fp16_t*>(v_in), layer_id,
+                                      reinterpret_cast<int*>(block_table), batch_size,
+                                      max_block_num, reinterpret_cast<int*>(cache_seqlens), q_len,
+                                      &backend);
+          },
+          py::arg("k_in"), py::arg("v_in"), py::arg("layer_id"), py::arg("block_table"),
+          py::arg("batch_size"), py::arg("max_block_num"), py::arg("cache_seqlens"),
+          py::arg("q_len"), py::arg("backend"), py::call_guard<py::gil_scoped_release>())
+      /*
+       * 这个 binding 调用原名 get_and_update_kvcache_fp16：先导出历史 K/V，再写入新的 FP16 K/V。
+       * k_in、v_in、block_table、cache_seqlens 是 CPU 地址，其余参数保持原函数含义和顺序。
+       */
+      .def(
+          "get_and_update_kvcache_fp16",
+          [](dense::KVCache& cache, uintptr_t k_in, uintptr_t v_in, int layer_id,
+             uintptr_t block_table, int batch_size, int max_block_num,
+             uintptr_t cache_seqlens, int q_len, WorkerPool& backend) {
+            cache.get_and_update_kvcache_fp16(
+                reinterpret_cast<ggml_fp16_t*>(k_in), reinterpret_cast<ggml_fp16_t*>(v_in),
+                layer_id, reinterpret_cast<int*>(block_table), batch_size, max_block_num,
+                reinterpret_cast<int*>(cache_seqlens), q_len, &backend);
+          },
+          py::arg("k_in"), py::arg("v_in"), py::arg("layer_id"), py::arg("block_table"),
+          py::arg("batch_size"), py::arg("max_block_num"), py::arg("cache_seqlens"),
+          py::arg("q_len"), py::arg("backend"), py::call_guard<py::gil_scoped_release>())
+      /*
+       * 这个 binding 导出每个 batch 的全部有效 K/V。k_in/v_in 是 FP16 输出地址，paged 映射由
+       * block_table/cache_seqlens 给出，其余参数描述层、表形状和并行后端。
+       */
+      .def(
+          "get_kvcache_fp16",
+          [](dense::KVCache& cache, uintptr_t k_in, uintptr_t v_in, int layer_id,
+             uintptr_t block_table, int batch_size, int max_block_num, uintptr_t cache_seqlens,
+             WorkerPool& backend) {
+            cache.get_kvcache_fp16(reinterpret_cast<ggml_fp16_t*>(k_in),
+                                   reinterpret_cast<ggml_fp16_t*>(v_in), layer_id,
+                                   reinterpret_cast<int*>(block_table), batch_size, max_block_num,
+                                   reinterpret_cast<int*>(cache_seqlens), &backend);
+          },
+          py::arg("k_in"), py::arg("v_in"), py::arg("layer_id"), py::arg("block_table"),
+          py::arg("batch_size"), py::arg("max_block_num"), py::arg("cache_seqlens"),
+          py::arg("backend"), py::call_guard<py::gil_scoped_release>())
+      /*
+       * 这个 binding 对已有全部 KV 执行 q_len=1 GQA Attention。q_in/output/attn_lse 是 CPU tensor 地址，
+       * layer_idx 和 paged 参数定位数据，backend 负责按 batch/KV-head/block 并行。
+       */
+      .def(
+          "attn",
+          [](dense::KVCache& cache, uintptr_t q_in, uintptr_t output, uintptr_t attn_lse, int layer_idx,
+             int generate_token_idx, int q_len, int batch_size, int max_block_num,
+             uintptr_t block_table, uintptr_t cache_seqlens, WorkerPool& backend) {
+            cache.attn(reinterpret_cast<const ggml_fp16_t*>(q_in), reinterpret_cast<ggml_fp16_t*>(output),
+                       reinterpret_cast<float*>(attn_lse), layer_idx, generate_token_idx, q_len,
+                       batch_size, max_block_num, reinterpret_cast<int*>(block_table),
+                       reinterpret_cast<int*>(cache_seqlens), &backend);
+          },
+          py::arg("q_in"), py::arg("output"), py::arg("attn_lse"), py::arg("layer_idx"),
+          py::arg("generate_token_idx"), py::arg("q_len"), py::arg("batch_size"),
+          py::arg("max_block_num"), py::arg("block_table"),
+          py::arg("cache_seqlens"), py::arg("backend"), py::call_guard<py::gil_scoped_release>())
+      /*
+       * 这个 binding 执行融合 Decode：写当前 K/V、递增 cache_seqlens，再读取全部 KV 计算 Attention。
+       * q_in/k_in/v_in/output/attn_lse 是 CPU tensor 地址，layer_idx、paged 参数和 backend 描述执行范围。
+       */
+      .def(
+          "attn_with_kvcache",
+          [](dense::KVCache& cache, uintptr_t q_in, uintptr_t k_in, uintptr_t v_in, uintptr_t output,
+             uintptr_t attn_lse, int layer_idx, int generate_token_idx, int q_len, int batch_size,
+             int max_block_num, uintptr_t block_table, uintptr_t cache_seqlens,
+             WorkerPool& backend) {
+            cache.attn_with_kvcache(
+                reinterpret_cast<const ggml_fp16_t*>(q_in), reinterpret_cast<const ggml_fp16_t*>(k_in),
+                reinterpret_cast<const ggml_fp16_t*>(v_in), reinterpret_cast<ggml_fp16_t*>(output),
+                reinterpret_cast<float*>(attn_lse), layer_idx, generate_token_idx, q_len, batch_size,
+                max_block_num, reinterpret_cast<int*>(block_table),
+                reinterpret_cast<int*>(cache_seqlens), &backend);
+          },
+          py::arg("q_in"), py::arg("k_in"), py::arg("v_in"), py::arg("output"), py::arg("attn_lse"),
+          py::arg("layer_idx"), py::arg("generate_token_idx"), py::arg("q_len"),
+          py::arg("batch_size"), py::arg("max_block_num"), py::arg("block_table"),
+          py::arg("cache_seqlens"), py::arg("backend"),
+          py::call_guard<py::gil_scoped_release>())
+      /*
+       * 这个 binding 调用原名 clear_kvcache_all_layers，清零 block_table 引用的所有层 FP16 K/V。
+       * block_table 和 cache_seqlens 是 CPU 地址，batch_size/max_block_num 描述表形状，backend 执行原任务划分。
+       */
+      .def(
+          "clear_kvcache_all_layers",
+          [](dense::KVCache& cache, uintptr_t block_table, uintptr_t cache_seqlens,
+             int batch_size, int max_block_num, WorkerPool& backend) {
+            cache.clear_kvcache_all_layers(reinterpret_cast<int*>(block_table),
+                                           reinterpret_cast<int*>(cache_seqlens), batch_size,
+                                           max_block_num, &backend);
+          },
+          py::arg("block_table"), py::arg("cache_seqlens"), py::arg("batch_size"),
+          py::arg("max_block_num"), py::arg("backend"),
+          py::call_guard<py::gil_scoped_release>())
+      /*
+       * 这个 binding 调用原名 dump_kvcache，按逻辑 block_table 把 FP16 K/V 快照写入文件。
+       * block_table 是 CPU 地址，cache_total_len 是有效长度，tensor_file_path 是目标路径。
+       */
+      .def(
+          "dump_kvcache",
+          [](dense::KVCache& cache, uintptr_t block_table, int cache_total_len,
+             const std::string& tensor_file_path, WorkerPool& backend) {
+            cache.dump_kvcache(reinterpret_cast<int*>(block_table), cache_total_len,
+                               tensor_file_path, &backend);
+          },
+          py::arg("block_table"), py::arg("cache_total_len"),
+          py::arg("tensor_file_path"), py::arg("backend"),
+          py::call_guard<py::gil_scoped_release>())
+      /*
+       * 这个 binding 调用原名 load_kvcache，从原逻辑顺序的 FP16 快照恢复缓存。
+       * tensor_file_path 是输入路径，backend 参数保留原接口位置。
+       */
+      .def(
+          "load_kvcache",
+          [](dense::KVCache& cache, const std::string& tensor_file_path,
+             WorkerPool& backend) { cache.load_kvcache(tensor_file_path, &backend); },
+          py::arg("tensor_file_path"), py::arg("backend"),
+          py::call_guard<py::gil_scoped_release>());
 
   auto utils = m.def_submodule("utils");
 
