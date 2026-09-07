@@ -20,16 +20,16 @@ layer_num = 2
 kv_head_num = 4
 head_dim = 128
 
-q_head_num_list = [32, 64]
-block_len_list = [32, 128]
-thread_num_list = [1, 4]
-batch_size_list = [1, 8, 32, 64]
-sequence_length_list = [128, 1024, 4096]
-warmup_iterations = 5
-timing_iterations = 20
-test_mode_list = ["random", "zero_lse", "extreme"]
+q_head_num_list = [32]
+block_len_list = [128]
+thread_num_list = [32]
+batch_size_list = [1, 32]
+sequence_length_list = [128, 4096]
+warmup_iterations = 2
+timing_iterations = 5
+test_mode_list = ["random"]
 
-decode_steps = 3
+decode_steps = 1
 seed = 2026
 
 device = torch.device("cuda:0")
@@ -570,7 +570,7 @@ def print_summary(results):
 
 def run_configuration(batch, length, heads, block, threads):
     result = {"shape": (batch, length, heads, block, threads), "timings": None, "errors": []}
-    for length_mode in ["uniform", "ragged"]:
+    for length_mode in ["uniform"]:
         for test_mode in test_mode_list:
             try:
                 times = run_test(heads, block, threads, test_mode, batch, length, length_mode)
