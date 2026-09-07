@@ -9,7 +9,6 @@
 """
 
 import argparse
-import importlib
 import math
 
 import torch
@@ -174,9 +173,10 @@ def main():
         raise SystemExit("无法导入 flash_attn_with_kvcache；请安装匹配当前 PyTorch/CUDA 的 flash-attn。\n"
                          f"原始错误：{error}") from error
     try:
-        ext = importlib.import_module("kt_kernel_ext")
+        # 安装产物是 kt_kernel 包的子模块；导入包时还会完成 CPU variant 选择。
+        from kt_kernel import kt_kernel_ext as ext
     except ImportError as error:
-        raise SystemExit("无法导入 kt_kernel_ext；请在已编译本仓库扩展的 Linux Python 环境运行。\n"
+        raise SystemExit("无法从 kt_kernel 导入 kt_kernel_ext；请确认测试与安装使用同一个 Python。\n"
                          f"原始错误：{error}") from error
     if not hasattr(ext, "dense_kvcache"):
         raise SystemExit("当前 kt_kernel_ext 没有 dense_kvcache，请重新编译本仓库版本。")
