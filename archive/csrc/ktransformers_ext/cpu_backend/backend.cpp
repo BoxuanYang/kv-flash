@@ -67,6 +67,8 @@ void Backend::do_work_stealing_job(int task_num,
     // 为主线程设置 thread_local_id
     thread_local_id = 0;
 
+
+    // 为每个工作线程划分任务范围，并唤醒
     for (int i = 1; i < thread_num_; i++) {
         thread_state_[i].curr->store(thread_state_[i - 1].end,
                                      std::memory_order_relaxed);
@@ -74,10 +76,14 @@ void Backend::do_work_stealing_job(int task_num,
         thread_state_[i].status->store(ThreadStatus::WORKING,
                                        std::memory_order_release);
     }
+
+    // 设置主线程的任务范围，并开始处理任务
     thread_state_[0].curr->store(0, std::memory_order_relaxed);
     thread_state_[0].status->store(ThreadStatus::WORKING,
                                    std::memory_order_release);
     process_tasks(0);
+
+    // Busy wait，等待所有工作线程完成任务
     for (int i = 1; i < thread_num_; i++) {
         while (thread_state_[i].status->load(std::memory_order_acquire) ==
                ThreadStatus::WORKING) {

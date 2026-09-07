@@ -36,6 +36,7 @@ std::string ggml_type_to_string(ggml_type type);
  * @brief Dense KV cache 的配置结构体。
  *
  * 该结构保存模型形状、FP16 KV 类型以及 block、batch 和线程容量上限。
+ * KVCache 接受 Qwen3 的 Q=32/64、KV=4、D=128，block_len 为正的 8 倍数。
  * 这个结构来自原 KVCacheConfig，删除了 anchor、retrieval 和稀疏复用配置成员。
  */
 struct KVCacheConfig {
@@ -66,7 +67,7 @@ struct KVCacheConfig {
    * @param q_head_num 每层 Query head 数。
    * @param head_dim 每个 Attention head 的特征维度。
    * @param block_len 每个物理 cache block 的 token 数。
-   * @param kv_type KV cache 数据类型；当前实例只实现 FP16，并为未来 INT8 扩展保留入口。
+   * @param kv_type KV cache 数据类型；当前实例只实现 FP16。
    * @param max_block_num 每层最多预分配的物理 block 数。
    * @param max_batch_size 最多预分配的 batch 数。
    * @param max_thread_num 最多预分配的工作线程数。
@@ -93,7 +94,7 @@ class KVCache {
   KVCache(KVCacheConfig config);
 
   /**
-   * @brief 调整 Cache 使用的线程数。
+   * @brief 调整线程工作区容量，不改变 WorkerPool 的线程数。
    *
    * 这个函数来自原 ThreadResize()，仅删除量化 Attention 使用的线程私有缓冲区。
    *
@@ -222,7 +223,7 @@ class KVCache {
    * @param attn_lse FP32 log-sum-exp 输出，布局为 [batch_size, q_len, q_head_num]。
    * @param layer_idx 当前模型层编号。
    * @param generate_token_idx 保留的原 Decode token 编号参数；Dense 路径不用于检索复用。
-   * @param q_len Query token 数；当前 Decode 调用约定为 1。
+   * @param q_len Query token 数；必须为 1，其他值在入口报错。
    * @param batch_size 并发序列数量。
    * @param max_block_num block_table 每行的表项数。
    * @param block_table 行优先的逻辑 block 到物理 block 完整映射。
@@ -303,7 +304,7 @@ class KVCache {
    * @param batch_size 序列数量。
    * @param max_block_num block_table 每行的表项数。
    * @param cache_seqlens 每个序列写入前的有效 token 数。
-   * @param q_len 要追加的 token 数；当前 Decode 调用约定为 1。
+   * @param q_len 要追加的 token 数；decode 为 1，历史 KV 批量导入可大于 1。
    * @param backend 并行写入 batch、KV head 和 token 的工作线程池。
    */
   void update_kvcache_fp16(const ggml_fp16_t* k_in, const ggml_fp16_t* v_in, int layer_id,
@@ -351,7 +352,7 @@ class KVCache {
  private:
   KVCacheConfig config_;
   int n_gqa_;
-  int cache_total_len_;
+  int cache_total_len_ = 0;
   std::vector<uint64_t> past_block_num_;
 
   // 与原 FP16 分支完全相同的四级 paged-cache 结构和布局。
@@ -364,17 +365,18 @@ class KVCache {
   std::vector<std::vector<std::vector<std::vector<ggml_fp16_t>>>> v_cache_fp16_; 
 
   int64_t layer_id_;
-  int* block_table_;
+  const int* block_table_;
   // 每个 sequence 在完整 block_table 中分配的 block 槽位数，不表示当前已经使用的 block 数；
   // 对应原稀疏代码库中的 max_block_num_after_retrieval_。
   int block_num_per_seq_;
 
-  int seq_len_;
-  uint16_t* k_data_;
-  uint16_t* v_data_;
-
   // 保持原 block-parallel Attention 所需的 batch/head、锁和线程私有状态。
   std::vector<int> cache_seqlens_;
+  // [batch + 1] 有效 block 任务的前缀和；不是 block_table 的行偏移。
+  std::vector<int> task_offsets_;
+  // 每个 batch/head 是否已有全局结果；使用字节数组，避免 vector<bool> 的位共享。
+  std::vector<std::vector<uint8_t>> output_valid_;
+  std::vector<uint8_t> thread_local_failed_;
 
   // 这里的mutex，指的是为每一个batch的每一个kv head 分配一个 mutex 
   std::vector<std::vector<std::unique_ptr<std::mutex>>> mutex_;
@@ -386,66 +388,24 @@ class KVCache {
   std::vector<std::vector<float>> thread_local_attn_lse_;
   std::vector<std::vector<float>> thread_local_cur_output_fp32_;
   std::vector<std::vector<float>> thread_local_cur_attn_lse_;
-  std::vector<std::vector<uint8_t>> thread_local_attn_mask_;
-  std::vector<std::vector<char>> thread_local_draft_;
+  std::vector<std::vector<ggml_fp16_t>> thread_local_probability_fp16_;
 
-  /**
-   * @brief 初始化 KV-head Attention 的累加状态和完整 block 表。
-   *
-   * 这个函数来自原 attn_initialize_kvhead_()，删除了检索堆、相似度和稀疏表初始化。
-   *
-   * @param batch_size 要初始化的 Query 行数。
-   * @param layer_idx 当前模型层编号。
-   * @param block_table 行优先的完整逻辑 block 到物理 block 映射。
-   * @param max_block_num block_table 每行的宽度。
-   * @param cache_seqlens 每个序列当前有效的 KV token 数。
-   */
-  void attn_initialize_kvhead_(int batch_size, int layer_idx, int* block_table,
-                               int& max_block_num, int* cache_seqlens);
-  /**
-   * @brief 按 KV head 独立计算分块 Attention。
-   *
-   * 这个函数来自原 attention_kvhead_()，删除了稀疏检索表和量化分支，保留原 block 并行与 LSE 归并。
-   *
-   * @param q_in_data FP16 Query 数据。
-   * @param output FP16 Attention 输出。
-   * @param attn_lse FP32 log-sum-exp 输出。
-   * @param batch_size 要处理的 Query 行数。
-   * @param backend 执行 block Attention 和结果归并的工作线程池。
-   */
-  void attention_kvhead_(const uint16_t* q_in_data, ggml_fp16_t* output,
+  // 重置累计状态，并按每个序列的有效 block 数构建任务前缀和。
+  void attn_initialize_kvhead_(int batch_size, int layer_idx, const int* block_table,
+                               int block_table_stride, const int* cache_seqlens);
+
+  // 一个任务计算一个 (batch, KV head, block)，使用现有线程内累计和带锁提交策略。
+  void attention_kvhead_(const ggml_fp16_t* q_in, ggml_fp16_t* output,
                          float* attn_lse, int batch_size, WorkerPool* backend);
 
-  /**
-   * @brief 使用 KV cache 计算单个物理 block 的 FP16 Attention。
-   *
-   * 这个函数来自原 attn_with_kvcache_one_block_()，删除了 sparse anchor 参数和量化执行分支。
-   *
-   * @param head_dim 每个 Attention head 的特征维度。
-   * @param bsz 共享一个 KV head 的 GQA Query head 数。
-   * @param q_type Query 类型；当前必须为 FP16。
-   * @param q Query，布局为 [bsz, head_dim]。
-   * @param past_kv_len 当前物理 block 的 token 容量。
-   * @param past_kv_offset 当前 block 的逻辑偏移；保留原参数位置。
-   * @param is_full_attn 是否使用全 1 mask。
-   * @param attn_mask 尾 block 使用的位矩阵 mask。
-   * @param k_type Key cache 类型；当前必须为 FP16。
-   * @param k_cache Key cache，布局为 [past_kv_len, head_dim]。
-   * @param v_type Value cache 类型；当前必须为 FP16。
-   * @param v_cache Value cache，布局为 [head_dim, past_kv_len]。
-   * @param attn_score FP32 Attention score 工作区。
-   * @param output 当前 block 的 FP32 输出。
-   * @param lse 当前 block 的 FP32 log-sum-exp 输出。
-   * @param draft 调用方预分配的临时工作区。
-   * Query 和 Key cache 必须已经完成所需的 Norm 与 RoPE。
-   */
-  void attn_with_kvcache_one_block_(int head_dim, int bsz, ggml_type q_type,
-                                    const void* q, int past_kv_len, int past_kv_offset,
-                                    bool is_full_attn, const uint8_t* attn_mask,
-                                    ggml_type k_type, const void* k_cache,
-                                    ggml_type v_type, const void* v_cache,
-                                    float* attn_score, void* output, float* lse,
-                                    void* draft);
+  // Q [G,D], K [T,D], V [D,T] 为 FP16；有效 token 为 [0, valid_tokens)。
+  // score/probability [G,T]；output [G,D]、lse [G] 为 FP32 单块结果。
+  // 返回 false 表示当前 GEMM 不支持该配置，由调用线程在任务完成后报告。
+  bool attn_with_kvcache_one_block_(int head_dim, int n_gqa, const ggml_fp16_t* q,
+                                    int block_len, int valid_tokens,
+                                    const ggml_fp16_t* k_cache, const ggml_fp16_t* v_cache,
+                                    float* attn_score, float* output, float* lse,
+                                    ggml_fp16_t* probability);
 };
 
 /**

@@ -40,6 +40,8 @@ void KVCache::attention_kvhead_(const uint16_t* q_in_data, ggml_fp16_t* output, 
         thread_cur_head_idx_[thread_id].first = -1;
         thread_cur_head_idx_[thread_id].second = -1;
       },
+
+      // 计算一个block
       [&](int task_id) {
         int batch_id = task_id / (config_.kv_head_num * max_block_num_after_retrieval_);
         int head_id =
@@ -215,6 +217,8 @@ void KVCache::attention_kvhead_(const uint16_t* q_in_data, ggml_fp16_t* output, 
           }
         }
       },
+
+      // Final_func()：
       // Merge the results of the remaining blocks.
       [&](int thread_id) {
         int cur_batch_idx = thread_cur_head_idx_[thread_id].first;
@@ -1952,11 +1956,25 @@ void KVCache::attn_with_kvcache_one_block_(int head_dim, int bsz,
                                            // window_size=(-1, -1),  # -1 means infinite context window
                                            // alibi_slopes=None,
 ) {
+  // 本函数只处理一个物理 KV block。bsz 通常等于 n_gqa_，即共享同一个 KV head 的 Query head 数量。
+  // 输入和中间结果的逻辑形状如下：
+  //   q          : [bsz, head_dim]
+  //   k_cache    : [past_kv_len, head_dim]
+  //   v_cache    : [head_dim, past_kv_len]，为便于计算 P * V 而按转置方向存储
+  //   attn_score : [bsz, past_kv_len]
+  //   output     : [bsz, head_dim]
+  // 算法依次执行 S = Q*K^T/sqrt(head_dim)、可选 mask、P = softmax(S)、O = P*V，并为每个 Query head
+  // 返回当前 block 的 lse = log(sum(exp(S)))。上层函数使用这个 lse 对不同 block 的 O 做全局归一化合并。
+  // 所有中间缓冲区均由调用方预分配；除可选 RoPE 分支中的小型临时 vector 外，此处不为 Attention 主数据 malloc。
+
+  // 当前矩阵 kernel 以 32 个元素为一个量化单元，因此 head_dim 必须能被 32 整除；K 固定按 token 量化，
+  // V 固定按 channel 量化。q_type 同时决定走纯 FP16 路径还是量化路径。
   assert(head_dim % 32 == 0);
   assert(k_quant_type == 0);
   assert(v_quant_type == 1);
   assert(q_type == GGML_TYPE_F16 || q_type == GGML_TYPE_Q8_0);
   if (q_type == GGML_TYPE_F16) {
+    // FP16 路径要求 Q、K、V 三者均为 FP16；两次 SGEMM 的累加结果仍然使用 FP32。
     assert(k_type == GGML_TYPE_F16);
     assert(v_type == GGML_TYPE_F16);
 
@@ -1965,6 +1983,8 @@ void KVCache::attn_with_kvcache_one_block_(int head_dim, int bsz,
     assert(num_k_anchor == 0);
 
     if (rotary_angle != nullptr) {
+      // 若调用方提供每个 token 的 RoPE 位置，则先把旋转后的 K 写入 draft 中的一段 FP16 临时区域，
+      // 后续 QK 只读取这份临时 K，不会改写 KV Cache 中保存的原始 K。
       ggml_fp16_t* k_cache_with_rope_fp16 =
           (reinterpret_cast<ggml_fp16_t*>(draft) + sizeof(block_q8_0) * bsz * past_kv_len / QK8_0 +
            sizeof(float) * bsz * head_dim);
@@ -2000,10 +2020,13 @@ void KVCache::attn_with_kvcache_one_block_(int head_dim, int bsz,
         }
       }
 
+      // 计算 Q*K^T：Q 为 [bsz, head_dim]，旋转后的 K 为 [past_kv_len, head_dim]，
+      // FP32 结果写入 attn_score[bsz, past_kv_len]。
       llamafile_sgemm(past_kv_len, bsz, head_dim, (ggml_fp16_t*)k_cache_with_rope_fp16, head_dim, (ggml_fp16_t*)q,
                       head_dim, attn_score, past_kv_len, 0, 1, GGML_TASK_TYPE_COMPUTE, k_type, GGML_TYPE_F16,
                       GGML_TYPE_F32, GGML_PREC_DEFAULT);
     } else {
+      // 常规路径直接用 KV Cache 中的原始 K 计算 Q*K^T，输出布局同样为 [bsz, past_kv_len]。
       bool ok = llamafile_sgemm(past_kv_len, bsz, head_dim, (ggml_fp16_t*)k_cache, head_dim, (ggml_fp16_t*)q, head_dim,
                                 attn_score, past_kv_len, 0, 1, GGML_TASK_TYPE_COMPUTE, k_type, GGML_TYPE_F16,
                                 GGML_TYPE_F32, GGML_PREC_DEFAULT);
@@ -2013,10 +2036,13 @@ void KVCache::attn_with_kvcache_one_block_(int head_dim, int bsz,
       }
     }
     // attn = attn * scale
+    // scaled dot-product Attention 的缩放：逐元素执行 S <- S / sqrt(head_dim)。
     float scale_factor = 1.0 / std::sqrt(float(head_dim));
     ggml_vec_scale_f32(bsz * past_kv_len, attn_score, scale_factor);
 
     // attn = attn & mask
+    // is_full_attn == false 通常表示这是未填满的尾 block。attn_mask 每一位对应一个 token；位为 0 的
+    // score 被写成 float 最小值，经过 exp 后近似为 0，因此该 token 不参与 Softmax。
     if (!is_full_attn) {
       for (int i = 0; i < bsz; i++) {
         for (int j = 0; j < past_kv_len; j++) {
@@ -2029,6 +2055,9 @@ void KVCache::attn_with_kvcache_one_block_(int head_dim, int bsz,
     }
 
     // attn = softmax(attn)
+    // 对每个 Query head 独立执行 block 内 Softmax。attn_score 会被原地改写为概率 P；同时保存当前 block
+    // 的 log-sum-exp，供 attention_kvhead_()/attention_layer_() 合并多个 block 时恢复全局 Softmax 权重。
+    // 注意：当前实现直接计算 exp(score)，没有先减去该行最大值，长序列或较大 score 下可能发生数值溢出。
     for (int i = 0; i < bsz; i++) {
       float sum_exp = 0;
       for (int j = 0; j < past_kv_len; j++) {
@@ -2045,10 +2074,14 @@ void KVCache::attn_with_kvcache_one_block_(int head_dim, int bsz,
 
     // output = attn * v + attn * v_anchor
     // std::vector<float> sum(bsz * head_dim);
+    // draft 是一整块复用工作区。这里跳过前方为量化 Attention 权重预留的区域，将随后的一段解释为
+    // FP32 sum[bsz, head_dim]，用于接收 P*V 的矩阵乘结果。
     float* sum =
         reinterpret_cast<float*>(reinterpret_cast<char*>(draft) + sizeof(block_q8_0) * bsz * past_kv_len / QK8_0);
 
     // float* attn_score_fp16(bsz, past_kv_len)
+    // llamafile 的 FP16 SGEMM 需要 FP16 右操作数，因此把 FP32 Softmax 概率转换到 draft 中另一段
+    // attn_score_fp16[bsz, past_kv_len]；原始 FP32 attn_score 仍由调用方持有。
     ggml_fp16_t* attn_score_fp16 = (reinterpret_cast<ggml_fp16_t*>(reinterpret_cast<char*>(draft) +
                                                                    sizeof(block_q8_0) * bsz * past_kv_len / QK8_0 +
                                                                    sizeof(float) * bsz * head_dim));
@@ -2059,6 +2092,8 @@ void KVCache::attn_with_kvcache_one_block_(int head_dim, int bsz,
 
     // TODO: anchor
     assert(num_v_anchor == 0);
+    // 计算 P*V：P 为 [bsz, past_kv_len]，V 的逻辑布局为 [head_dim, past_kv_len]，结果为
+    // FP32 sum[bsz, head_dim]。这里的 v_cache 布局正是 K/V cache 大小和排列方式不同的原因之一。
     bool ok = llamafile_sgemm(head_dim, bsz, past_kv_len, (ggml_fp16_t*)v_cache, past_kv_len,
                               (ggml_fp16_t*)attn_score_fp16, past_kv_len, sum, head_dim, 0, 1, GGML_TASK_TYPE_COMPUTE,
                               v_type, GGML_TYPE_F16, GGML_TYPE_F32, GGML_PREC_DEFAULT);
@@ -2067,12 +2102,18 @@ void KVCache::attn_with_kvcache_one_block_(int head_dim, int bsz,
     }
 
     // copy to output
+    // FP16 分支约定 output 实际指向 FP32 block 输出缓冲区；上层完成跨 block 合并后才转成最终 FP16 输出。
     for (int i = 0; i < bsz; i++) {
       for (int j = 0; j < head_dim; j++) {
         ((float*)output)[i * head_dim + j] = sum[i * head_dim + j];
       }
     }
-  } else {
+  } 
+  
+  // 忽略
+  else {
+    // 量化路径：Q 必须是 Q8_0，K/V 可以是 Q4_0 或 Q8_0。每 32 个标量组成一个量化 block，
+    // 所以下面的 SGEMM K 维度使用 head_dim/32 或 past_kv_len/32，而不是标量元素数量。
     assert(k_type == GGML_TYPE_Q4_0 || k_type == GGML_TYPE_Q8_0);
     assert(v_type == GGML_TYPE_Q4_0 || v_type == GGML_TYPE_Q8_0);
 
@@ -2081,6 +2122,8 @@ void KVCache::attn_with_kvcache_one_block_(int head_dim, int bsz,
     assert(num_k_anchor == 0);
 
     if (rotary_angle != nullptr) {
+      // 量化 K 无法直接原地应用 RoPE：先逐个 32 元素块反量化到 FP32，计算 RoPE 并暂存为 FP16，
+      // 再重新量化到 draft 中的临时 K。该过程只作用于本次计算，不修改持久化的量化 KV Cache。
       ggml_fp16_t* k_cache_with_rope_fp16 =
           (reinterpret_cast<ggml_fp16_t*>(draft) + sizeof(block_q8_0) * bsz * past_kv_len / QK8_0 +
            sizeof(float) * bsz * head_dim);
@@ -2121,6 +2164,7 @@ void KVCache::attn_with_kvcache_one_block_(int head_dim, int bsz,
         }
       }
       // quantize k_cache_with_rope_fp16
+      // 将应用 RoPE 后的临时 FP16 K 按 32 元素重新量化，以便与 Q8_0 Query 进入量化 SGEMM。
       for (int k = 0; k < past_kv_len; k++) {
         for (int l = 0; l < head_dim / 32; l++) {
           for (int m = 0; m < 32; m++) {
@@ -2130,20 +2174,24 @@ void KVCache::attn_with_kvcache_one_block_(int head_dim, int bsz,
         }
       }
 
+      // 量化 Q*K^T：量化 block 是 SGEMM 的最小 K 维单元，FP32 score 仍写成 [bsz, past_kv_len]。
       llamafile_sgemm(past_kv_len, bsz, head_dim / 32, (block_q4_0*)k_cache_with_rope_q4, head_dim / 32, (block_q8_0*)q,
                       head_dim / 32, attn_score, past_kv_len, 0, 1, GGML_TASK_TYPE_COMPUTE, k_type, GGML_TYPE_Q8_0,
                       GGML_TYPE_F32, GGML_PREC_DEFAULT);
     } else {
+      // 没有在线 RoPE 时，直接使用持久化的量化 K 和 Q8_0 Query 计算 FP32 Attention score。
       llamafile_sgemm(past_kv_len, bsz, head_dim / 32, (block_q4_0*)k_cache, head_dim / 32, (block_q8_0*)q,
                       head_dim / 32, attn_score, past_kv_len, 0, 1, GGML_TASK_TYPE_COMPUTE, k_type, GGML_TYPE_Q8_0,
                       GGML_TYPE_F32, GGML_PREC_DEFAULT);
     }
 
     // attn = attn * scale
+    // 量化矩阵乘只改变输入存储格式；得到 FP32 score 后仍执行标准的 1/sqrt(head_dim) 缩放。
     float scale_factor = 1.0 / std::sqrt(float(head_dim));
     ggml_vec_scale_f32(bsz * past_kv_len, attn_score, scale_factor);
 
     // attn = attn & mask
+    // 与 FP16 路径相同，尾 block 中 bit mask 为 0 的 token 被排除在 Softmax 之外。
     if (!is_full_attn) {
       for (int i = 0; i < bsz; i++) {
         for (int j = 0; j < past_kv_len; j++) {
@@ -2156,6 +2204,8 @@ void KVCache::attn_with_kvcache_one_block_(int head_dim, int bsz,
     }
 
     // attn = softmax(attn)
+    // Softmax 本身始终在 FP32 中完成，并输出当前 block 的概率和 LSE；量化只发生在矩阵乘输入处。
+    // 注意：此分支同样没有在 exp 前减去行最大值，行为与上面的 FP16 分支保持一致。
     for (int i = 0; i < bsz; i++) {
       float sum_exp = 0;
       for (int j = 0; j < past_kv_len; j++) {
@@ -2172,17 +2222,21 @@ void KVCache::attn_with_kvcache_one_block_(int head_dim, int bsz,
 
     // output = attn * v + attn * v_anchor
     // std::vector<block_q8_0> attn_q8_0(bsz * past_kv_len / QK8_0);
+    // 为调用量化 P*V kernel，把 FP32 Softmax 概率按连续 32 个元素量化为 Q8_0，并放在 draft 起始位置。
     block_q8_0* attn_q8_0 = reinterpret_cast<block_q8_0*>(draft);
     quantize_row_q8_0(attn_score, attn_q8_0, bsz * past_kv_len);
     // std::vector<float> sum(bsz * head_dim);
+    // draft 中紧随量化概率之后的区域作为 FP32 sum[bsz, head_dim]，接收 P*V 的累加结果。
     float* sum =
         reinterpret_cast<float*>(reinterpret_cast<char*>(draft) + sizeof(block_q8_0) * bsz * past_kv_len / QK8_0);
     // TODO: anchor
     assert(num_v_anchor == 0);
+    // 计算量化 P*V。V 按 channel 量化并以 [head_dim, past_kv_len] 方向存储，因此归约维度为
+    // past_kv_len/32，输出仍为 FP32 [bsz, head_dim]。
     llamafile_sgemm(head_dim, bsz, past_kv_len / 32, (block_q4_0*)v_cache, past_kv_len / 32, attn_q8_0,
                     past_kv_len / 32, sum, head_dim, 0, 1, GGML_TASK_TYPE_COMPUTE, v_type, GGML_TYPE_Q8_0,
                     GGML_TYPE_F32, GGML_PREC_DEFAULT);
-
+    // 量化分支把当前 block 的 FP32 输出转成 Q8_0；上层立即反量化为 FP32，再执行跨 block LSE 合并。
     quantize_row_q8_0(sum, (block_q8_0*)output, bsz * head_dim);
   }
 }

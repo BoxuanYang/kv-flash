@@ -1,7 +1,6 @@
 #include "dense_kvcache.h"
 
-#include <cassert>
-#include <chrono>
+#include <stdexcept>
 #include <cstdio>
 
 #include "ggml-impl.h"
@@ -26,10 +25,9 @@ std::string ggml_type_to_string(ggml_type type) {
 }
 
 /**
- * @brief 构造并校验 Dense KV cache 的静态配置。
+ * @brief 保存 Dense KV cache 的静态配置。
  *
- * 构造函数保存模型形状、block 大小和容量上限，打印完整配置，并校验 Query head 数能够被 KV head 数
- * 整除，以保证 GQA 分组 n_gqa 为整数。
+ * 保存并打印配置；KVCache 构造函数在分配前统一检查形状和容量。
  * 这个函数来自原 KVCacheConfig 构造函数，删除了 anchor、retrieval 和稀疏复用步长参数。
  *
  * @param layer_num 模型层数，也是 KV cache 的层维度。
@@ -60,7 +58,6 @@ KVCacheConfig::KVCacheConfig(int layer_num, int kv_head_num, int q_head_num, int
          layer_num, kv_head_num, q_head_num, head_dim, block_len,
          ggml_type_to_string(kv_type).c_str(), max_block_num, max_batch_size,
          max_thread_num);
-  assert(q_head_num % kv_head_num == 0);
 }
 
 /**
@@ -70,21 +67,21 @@ KVCacheConfig::KVCacheConfig(int layer_num, int kv_head_num, int q_head_num, int
  * BlockResize() 建立全部线程、batch 和 block 维度的缓冲区。
  * 这个函数来自原 KVCache 构造函数，删除了 sparse retrieval、anchor、importance 和量化存储初始化。
  *
- * @param config 已完成基本校验的 KVCacheConfig；其容量字段决定本实例的预分配上限。
+ * @param config 模型形状和容量；在本构造函数中统一校验。
  */
 KVCache::KVCache(KVCacheConfig config) {
-  this->config_ = config;
+  // 在创建缓存前检查，包括由可写配置字段传入的值；Release 构建不能依赖 assert。
+  if (config.kv_type != GGML_TYPE_F16 || config.head_dim != 128 || config.kv_head_num != 4 ||
+      (config.q_head_num != 32 && config.q_head_num != 64) || config.layer_num <= 0 ||
+      config.block_len <= 0 || config.block_len % 8 != 0 || config.max_block_num <= 0 ||
+      config.max_batch_size <= 0 || config.max_thread_num <= 0) {
+    throw std::invalid_argument("Dense cache requires FP16 Qwen3 heads (32/64 Q, 4 KV, D=128), positive capacities and block_len divisible by 8");
+  }
+  config_ = config;
   n_gqa_ = config_.q_head_num / config_.kv_head_num;
-  if (config_.kv_type == ggml_type::GGML_TYPE_F16) {
-    k_cache_fp16_.resize(config_.layer_num);
-    v_cache_fp16_.resize(config_.layer_num);
-  } else {
-    assert(false);
-  }
-  past_block_num_.resize(config.layer_num);
-  for (int i = 0; i < config.layer_num; i++) {
-    past_block_num_[i] = 0;
-  }
+  k_cache_fp16_.resize(config_.layer_num);
+  v_cache_fp16_.resize(config_.layer_num);
+  past_block_num_.resize(config_.layer_num, 0);
   ThreadResize(config.max_thread_num);
   BatchResize(config.max_batch_size);
   BlockResize(config.max_block_num);
@@ -93,36 +90,30 @@ KVCache::KVCache(KVCacheConfig config) {
 /**
  * @brief 并不真正调整线程数量，只调整每个工作线程独享的 Attention 临时缓冲区数量和大小。
  *
- * 每个线程获得 Attention score、FP32 输出、LSE、在线 block 归并状态、尾块 mask 和 kernel draft，
+ * 每个线程获得 Attention score、FP32 输出、LSE、在线 block 归并状态和 FP16 probability，
  * 避免并行 block 计算时发生临时内存竞争。
  * 这个函数来自原 ThreadResize()，仅删除了量化 Attention 使用的 Q8 输出缓冲区。
  *
  * @param thread_num 需要支持的最大并行工作线程数；应不小于 WorkerPool 的线程数。
  */
 void KVCache::ThreadResize(int thread_num) {
+  if (thread_num <= 0) throw std::invalid_argument("thread_num must be positive");
+  config_.max_thread_num = thread_num;
   thread_local_attn_score_.resize(thread_num);
   thread_local_output_fp32_.resize(thread_num);
   thread_local_attn_lse_.resize(thread_num);
   thread_local_cur_output_fp32_.resize(thread_num);
   thread_local_cur_attn_lse_.resize(thread_num);
-  thread_local_draft_.resize(thread_num);
+  thread_local_probability_fp16_.resize(thread_num);
+  thread_local_failed_.resize(thread_num);
   thread_cur_head_idx_.resize(thread_num);
-  thread_local_attn_mask_.resize(thread_num);
   for (int i = 0; i < thread_num; i++) {
     thread_local_attn_score_[i].resize(n_gqa_ * config_.block_len);
     thread_local_output_fp32_[i].resize(n_gqa_ * config_.head_dim);
     thread_local_attn_lse_[i].resize(n_gqa_);
     thread_local_cur_output_fp32_[i].resize(n_gqa_ * config_.head_dim);
     thread_local_cur_attn_lse_[i].resize(n_gqa_);
-    // FP16 Attention 工作区由两段组成：FP32 PV 输出，以及 FP16 Attention probability。
-    // 未来加入 INT8 时，应在这里按 kv_type 增加独立尺寸分支。
-    const size_t fp32_output_bytes =
-        sizeof(float) * n_gqa_ * config_.head_dim;
-    const size_t fp16_workspace_elements = n_gqa_ * config_.block_len;
-    const size_t fp16_workspace_bytes =
-        sizeof(ggml_fp16_t) * fp16_workspace_elements;
-    thread_local_draft_[i].resize(fp32_output_bytes + fp16_workspace_bytes);
-    thread_local_attn_mask_[i].resize(config_.block_len / 8);
+    thread_local_probability_fp16_[i].resize(n_gqa_ * config_.block_len);
   }
 }
 
@@ -135,11 +126,16 @@ void KVCache::ThreadResize(int thread_num) {
  * @param batch_size 需要预分配的最大 batch 数；运行时 batch 不得超过该值。
  */
 void KVCache::BatchResize(int batch_size) {
+  if (batch_size <= 0) throw std::invalid_argument("batch_size must be positive");
+  config_.max_batch_size = batch_size;
+  task_offsets_.resize(size_t(batch_size) + 1);
+  output_valid_.resize(batch_size);
   mutex_.resize(batch_size);
   output_fp32_.resize(batch_size);
   attn_lse_.resize(batch_size);
   cache_seqlens_.resize(batch_size);
   for (int i = 0; i < batch_size; i++) {
+    output_valid_[i].resize(config_.kv_head_num);
     mutex_[i].resize(config_.kv_head_num);
     output_fp32_[i].resize(config_.kv_head_num);
     attn_lse_[i].resize(config_.kv_head_num);
@@ -161,6 +157,8 @@ void KVCache::BatchResize(int batch_size) {
  * @param max_block_num 每层要支持的最大物理 block 数，通常等于 config_.max_block_num。
  */
 void KVCache::BlockResize(int max_block_num) {
+  if (max_block_num <= 0) throw std::invalid_argument("block_num must be positive");
+  config_.max_block_num = max_block_num;
   for (int layer_id = 0; layer_id < config_.layer_num; layer_id++) {
     k_cache_fp16_[layer_id].resize(config_.kv_head_num);
     v_cache_fp16_[layer_id].resize(config_.kv_head_num);
@@ -191,9 +189,6 @@ void KVCache::BlockResize(int max_block_num) {
 void KVCache::clear_kvcache_all_layers(int* block_table, int* cache_seqlens,
                                        int batch_size, int max_block_num,
                                        WorkerPool* backend) {
-  // Timer start
-  auto start = std::chrono::high_resolution_clock::now();
-  seq_len_ = config_.block_len;
   backend->do_work_stealing_job(
       config_.layer_num * batch_size * max_block_num * config_.kv_head_num, nullptr,
       [&](int task_id) {
@@ -201,7 +196,9 @@ void KVCache::clear_kvcache_all_layers(int* block_table, int* cache_seqlens,
         int batch_id = (task_id / (max_block_num * config_.kv_head_num)) % batch_size;
         int block_id = task_id / config_.kv_head_num % max_block_num;
         int head_id = task_id % config_.kv_head_num;
-        if (cache_seqlens[batch_id] / config_.block_len < block_id) return;
+        const int len = cache_seqlens[batch_id];
+        const int blocks = len / config_.block_len + (len % config_.block_len != 0);
+        if (block_id >= blocks) return;
         int block_idx = block_table[batch_id * max_block_num + block_id];
         for (int l = 0; l < config_.block_len * config_.head_dim; l++) {
           k_cache_fp16_[layer_id][head_id][block_idx][l] = 0;
@@ -209,10 +206,6 @@ void KVCache::clear_kvcache_all_layers(int* block_table, int* cache_seqlens,
         }
       },
       nullptr);
-
-  // Timer end
-  auto end = std::chrono::high_resolution_clock::now();
-  std::chrono::duration<double> duration = end - start;
 }
 
 /**

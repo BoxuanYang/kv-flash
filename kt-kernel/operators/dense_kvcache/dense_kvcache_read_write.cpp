@@ -1,6 +1,7 @@
 #include "dense_kvcache.h"
 
-#include <chrono>
+#include <limits>
+#include <stdexcept>
 
 namespace dense {
 
@@ -26,18 +27,13 @@ void KVCache::get_and_update_kvcache_fp16(ggml_fp16_t* k_in, ggml_fp16_t* v_in,
                                           int batch_size, int max_block_num,
                                           int* cache_seqlens, int q_len,
                                           WorkerPool* backend) {
-  // Timer start
-  auto start = std::chrono::high_resolution_clock::now();
-  layer_id_ = layer_id;
-  k_data_ = const_cast<uint16_t*>(k_in);
-  v_data_ = const_cast<uint16_t*>(v_in);
   backend->do_work_stealing_job(
       config_.kv_head_num * max_block_num * batch_size, nullptr,
       [&](int task_id) {
         int batch_id = task_id / (config_.kv_head_num * max_block_num);
         int block_id = (task_id / config_.kv_head_num) % max_block_num;
         int head_id = task_id % config_.kv_head_num;
-        int block_idx = block_table[batch_id * max_block_num + block_id];
+        int block_idx = block_table[size_t(batch_id) * max_block_num + block_id];
         int seq_len = cache_seqlens[batch_id];
         int block_l = block_id * config_.block_len;
         int block_r = block_id * config_.block_len + config_.block_len;
@@ -45,14 +41,14 @@ void KVCache::get_and_update_kvcache_fp16(ggml_fp16_t* k_in, ggml_fp16_t* v_in,
           for (int k = 0; k < config_.block_len; k++) {
             if (block_id * config_.block_len + k >= seq_len) break;
             for (int l = 0; l < config_.head_dim; l++) {
-              k_data_[batch_id * (max_block_num * config_.block_len * config_.kv_head_num * config_.head_dim) +
+              k_in[size_t(batch_id) * (max_block_num * config_.block_len * config_.kv_head_num * config_.head_dim) +
                       block_id * (config_.block_len * config_.kv_head_num * config_.head_dim) +
                       k * (config_.kv_head_num * config_.head_dim) + head_id * config_.head_dim + l] =
-                  k_cache_fp16_[layer_id_][head_id][block_idx][k * config_.head_dim + l];
-              v_data_[batch_id * (max_block_num * config_.block_len * config_.kv_head_num * config_.head_dim) +
+                  k_cache_fp16_[layer_id][head_id][block_idx][k * config_.head_dim + l];
+              v_in[size_t(batch_id) * (max_block_num * config_.block_len * config_.kv_head_num * config_.head_dim) +
                       block_id * (config_.block_len * config_.kv_head_num * config_.head_dim) +
                       k * (config_.kv_head_num * config_.head_dim) + head_id * config_.head_dim + l] =
-                  v_cache_fp16_[layer_id_][head_id][block_idx][l * config_.block_len + k];
+                  v_cache_fp16_[layer_id][head_id][block_idx][l * config_.block_len + k];
             }
           }
         }
@@ -62,12 +58,12 @@ void KVCache::get_and_update_kvcache_fp16(ggml_fp16_t* k_in, ggml_fp16_t* v_in,
                 block_id * config_.block_len + k < seq_len)
               continue;
             for (int l = 0; l < config_.head_dim; l++) {
-              k_cache_fp16_[layer_id_][head_id][block_idx][k * config_.head_dim + l] =
-                  k_data_[batch_id * (max_block_num * config_.block_len * config_.kv_head_num * config_.head_dim) +
+              k_cache_fp16_[layer_id][head_id][block_idx][k * config_.head_dim + l] =
+                  k_in[size_t(batch_id) * (max_block_num * config_.block_len * config_.kv_head_num * config_.head_dim) +
                           block_id * (config_.block_len * config_.kv_head_num * config_.head_dim) +
                           k * (config_.kv_head_num * config_.head_dim) + head_id * config_.head_dim + l];
-              v_cache_fp16_[layer_id_][head_id][block_idx][l * config_.block_len + k] =
-                  v_data_[batch_id * (max_block_num * config_.block_len * config_.kv_head_num * config_.head_dim) +
+              v_cache_fp16_[layer_id][head_id][block_idx][l * config_.block_len + k] =
+                  v_in[size_t(batch_id) * (max_block_num * config_.block_len * config_.kv_head_num * config_.head_dim) +
                           block_id * (config_.block_len * config_.kv_head_num * config_.head_dim) +
                           k * (config_.kv_head_num * config_.head_dim) + head_id * config_.head_dim + l];
             }
@@ -75,10 +71,6 @@ void KVCache::get_and_update_kvcache_fp16(ggml_fp16_t* k_in, ggml_fp16_t* v_in,
         }
       },
       nullptr);
-
-  // Timer end
-  auto end = std::chrono::high_resolution_clock::now();
-  std::chrono::duration<double> duration = end - start;
 }
 
 /**
@@ -100,18 +92,13 @@ void KVCache::get_and_update_kvcache_fp16(ggml_fp16_t* k_in, ggml_fp16_t* v_in,
 void KVCache::get_kvcache_fp16(ggml_fp16_t* k_in, ggml_fp16_t* v_in, int layer_id,
                                int* block_table, int batch_size, int max_block_num,
                                int* cache_seqlens, WorkerPool* backend) {
-  // Timer start
-  auto start = std::chrono::high_resolution_clock::now();
-  layer_id_ = layer_id;
-  k_data_ = const_cast<uint16_t*>(k_in);
-  v_data_ = const_cast<uint16_t*>(v_in);
   backend->do_work_stealing_job(
       config_.kv_head_num * max_block_num * batch_size, nullptr,
       [&](int task_id) {
         int batch_id = task_id / (config_.kv_head_num * max_block_num);
         int block_id = (task_id / config_.kv_head_num) % max_block_num;
         int head_id = task_id % config_.kv_head_num;
-        int block_idx = block_table[batch_id * max_block_num + block_id];
+        int block_idx = block_table[size_t(batch_id) * max_block_num + block_id];
         int seq_len = cache_seqlens[batch_id];
         int block_l = block_id * config_.block_len;
         int block_r = block_id * config_.block_len + config_.block_len;
@@ -119,23 +106,19 @@ void KVCache::get_kvcache_fp16(ggml_fp16_t* k_in, ggml_fp16_t* v_in, int layer_i
           for (int k = 0; k < config_.block_len; k++) {
             if (block_id * config_.block_len + k >= seq_len) break;
             for (int l = 0; l < config_.head_dim; l++) {
-              k_data_[batch_id * (max_block_num * config_.block_len * config_.kv_head_num * config_.head_dim) +
+              k_in[size_t(batch_id) * (max_block_num * config_.block_len * config_.kv_head_num * config_.head_dim) +
                       block_id * (config_.block_len * config_.kv_head_num * config_.head_dim) +
                       k * (config_.kv_head_num * config_.head_dim) + head_id * config_.head_dim + l] =
-                  k_cache_fp16_[layer_id_][head_id][block_idx][k * config_.head_dim + l];
-              v_data_[batch_id * (max_block_num * config_.block_len * config_.kv_head_num * config_.head_dim) +
+                  k_cache_fp16_[layer_id][head_id][block_idx][k * config_.head_dim + l];
+              v_in[size_t(batch_id) * (max_block_num * config_.block_len * config_.kv_head_num * config_.head_dim) +
                       block_id * (config_.block_len * config_.kv_head_num * config_.head_dim) +
                       k * (config_.kv_head_num * config_.head_dim) + head_id * config_.head_dim + l] =
-                  v_cache_fp16_[layer_id_][head_id][block_idx][l * config_.block_len + k];
+                  v_cache_fp16_[layer_id][head_id][block_idx][l * config_.block_len + k];
             }
           }
         }
       },
       nullptr);
-
-  // Timer end
-  auto end = std::chrono::high_resolution_clock::now();
-  std::chrono::duration<double> duration = end - start;
 }
 
 /**
@@ -153,18 +136,31 @@ void KVCache::get_kvcache_fp16(ggml_fp16_t* k_in, ggml_fp16_t* v_in, int layer_i
  * @param batch_size 序列数量。
  * @param max_block_num 每个序列的 block 表宽度。
  * @param cache_seqlens 每个序列写入前的有效 token 数。
- * @param q_len 每个序列要追加的 token 数；当前 Decode 调用约定为 1。
+ * @param q_len 每个序列要追加的 token 数；decode 为 1，历史 KV 导入可大于 1。
  * @param backend 用于并行写入 batch、KV head 和 token 的工作线程池。
  */
 void KVCache::update_kvcache_fp16(const ggml_fp16_t* k_in, const ggml_fp16_t* v_in,
                                   int layer_id, int* block_table, int batch_size,
                                   int max_block_num, int* cache_seqlens, int q_len,
                                   WorkerPool* backend) {
-  // Timer start
-  auto start = std::chrono::high_resolution_clock::now();
-  layer_id_ = layer_id;
-  k_data_ = const_cast<uint16_t*>(k_in);
-  v_data_ = const_cast<uint16_t*>(v_in);
+  if (!backend || (backend->config.subpool_thread_count.empty() || backend->config.subpool_thread_count[0] <= 0 ||
+      backend->config.subpool_thread_count[0] > config_.max_thread_num) || batch_size < 0 ||
+      batch_size > config_.max_batch_size || layer_id < 0 || layer_id >= config_.layer_num ||
+      max_block_num < 0 || q_len < 0) throw std::invalid_argument("invalid KV update dimensions or capacity");
+  if (batch_size == 0 || q_len == 0) return;
+  if (!k_in || !v_in || !block_table || !cache_seqlens) throw std::invalid_argument("null KV update input");
+  if (int64_t(batch_size) * config_.kv_head_num * q_len > std::numeric_limits<int>::max()) {
+    throw std::overflow_error("too many KV update tasks");
+  }
+  for (int b = 0; b < batch_size; ++b) {
+    const int64_t end = int64_t(cache_seqlens[b]) + q_len;
+    if (cache_seqlens[b] < 0 || end > std::numeric_limits<int>::max() ||
+        end > int64_t(max_block_num) * config_.block_len) throw std::invalid_argument("KV update exceeds block table");
+    for (int block = cache_seqlens[b] / config_.block_len; block <= (end - 1) / config_.block_len; ++block) {
+      const int physical = block_table[size_t(b) * max_block_num + block];
+      if (physical < 0 || physical >= config_.max_block_num) throw std::invalid_argument("invalid physical KV block");
+    }
+  }
   backend->do_work_stealing_job(
       batch_size * config_.kv_head_num * q_len, nullptr,
       [&](int task_id) {
@@ -173,22 +169,18 @@ void KVCache::update_kvcache_fp16(const ggml_fp16_t* k_in, const ggml_fp16_t* v_
         int seq_len = cache_seqlens[batch_id] + task_id % q_len;
         int q_offset = task_id % q_len;
         int block_id = seq_len / config_.block_len;
-        int block_idx = block_table[batch_id * max_block_num + block_id];
+        int block_idx = block_table[size_t(batch_id) * max_block_num + block_id];
         int pos_in_block = seq_len % config_.block_len;
         for (int l = 0; l < config_.head_dim; l++) {
-          k_cache_fp16_[layer_id_][head_id][block_idx][pos_in_block * config_.head_dim + l] =
-              k_data_[batch_id * (q_len * config_.kv_head_num * config_.head_dim) +
+          k_cache_fp16_[layer_id][head_id][block_idx][pos_in_block * config_.head_dim + l] =
+              k_in[size_t(batch_id) * q_len * config_.kv_head_num * config_.head_dim +
                       q_offset * config_.kv_head_num * config_.head_dim + head_id * config_.head_dim + l];
-          v_cache_fp16_[layer_id_][head_id][block_idx][l * config_.block_len + pos_in_block] =
-              v_data_[batch_id * (q_len * config_.kv_head_num * config_.head_dim) +
+          v_cache_fp16_[layer_id][head_id][block_idx][l * config_.block_len + pos_in_block] =
+              v_in[size_t(batch_id) * q_len * config_.kv_head_num * config_.head_dim +
                       q_offset * config_.kv_head_num * config_.head_dim + head_id * config_.head_dim + l];
         }
       },
       nullptr);
-
-  // Timer end
-  auto end = std::chrono::high_resolution_clock::now();
-  std::chrono::duration<double> duration = end - start;
 }
 
 }  // namespace dense

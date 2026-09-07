@@ -74,7 +74,6 @@ static const bool _is_plain_ = false;
 
 #include "operators/kvcache/kvcache.h"
 #include "operators/dense_kvcache/dense_kvcache.h"
-#include "operators/dense_kvcache/qwen3_cpu_ops.h"
 #include "operators/llamafile/linear.h"
 #include "operators/llamafile/mla.hpp"
 #include "operators/llamafile/mlp.h"
@@ -988,35 +987,6 @@ PYBIND11_MODULE(kt_kernel_ext, m) {
 
   // Dense KVCache 是原 KVCache 删除稀疏和量化分支后的 FP16 全量 GQA Decode 接口。
   auto dense_kvcache_module = m.def_submodule("dense_kvcache");
-  dense_kvcache_module.def(
-      "rms_norm_fp16",
-      [](uintptr_t input, uintptr_t weight, uintptr_t output, int rows,
-         int hidden_dim, float eps, WorkerPool& backend) {
-        dense::rms_norm_fp16(reinterpret_cast<const ggml_fp16_t*>(input),
-                            reinterpret_cast<const ggml_fp16_t*>(weight),
-                            reinterpret_cast<ggml_fp16_t*>(output), rows,
-                            hidden_dim, eps, &backend);
-      },
-      py::arg("input"), py::arg("weight"), py::arg("output"), py::arg("rows"),
-      py::arg("hidden_dim"), py::arg("eps"), py::arg("backend"),
-      py::call_guard<py::gil_scoped_release>());
-  dense_kvcache_module.def(
-      "qwen3_rope_fp16",
-      [](uintptr_t q, uintptr_t k, uintptr_t position_ids, uintptr_t cos,
-         uintptr_t sin, int batch_size, int q_len, int q_head_num,
-         int kv_head_num, int head_dim, WorkerPool& backend) {
-        dense::qwen3_rope_fp16(
-            reinterpret_cast<ggml_fp16_t*>(q),
-            reinterpret_cast<ggml_fp16_t*>(k),
-            reinterpret_cast<const int*>(position_ids),
-            reinterpret_cast<const ggml_fp16_t*>(cos),
-            reinterpret_cast<const ggml_fp16_t*>(sin), batch_size, q_len,
-            q_head_num, kv_head_num, head_dim, &backend);
-      },
-      py::arg("q"), py::arg("k"), py::arg("position_ids"), py::arg("cos"),
-      py::arg("sin"), py::arg("batch_size"), py::arg("q_len"),
-      py::arg("q_head_num"), py::arg("kv_head_num"), py::arg("head_dim"),
-      py::arg("backend"), py::call_guard<py::gil_scoped_release>());
   py::class_<dense::KVCacheConfig>(dense_kvcache_module, "KVCacheConfig")
       .def(py::init<int, int, int, int, int, ggml_type, int, int, int>(),
            py::arg("layer_num"), py::arg("kv_head_num"), py::arg("q_head_num"), py::arg("head_dim"),
