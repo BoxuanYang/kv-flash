@@ -47,7 +47,7 @@ def check_output(label, actual, actual_lse, expected, expected_lse):
 
 
 @torch.no_grad()
-def run_case(ext, flash_attn_with_kvcache, device,
+def run_case(ext, flash_attn_with_kvcache, device, numa_node,
              q_heads, block_len, threads, steps, mode, seed, long_context):
     kv_heads, head_dim, layers = 4, 128, 2
     lengths_list = [0, 1, block_len - 1, block_len, block_len + 1,
@@ -82,8 +82,16 @@ def run_case(ext, flash_attn_with_kvcache, device,
         block_table[b, :count] = permutation[offset:offset + count]
         offset += count
 
+    # WorkerPool(int) 会把总线程数平均分到所有 NUMA 节点；当 threads 小于节点数时，
+    # 每个子池会得到 0 个线程。这里明确创建一个子池，保证 --threads 就是实际工作线程数。
+    worker_config = ext.WorkerPoolConfig()
+    worker_config.subpool_count = 1
+    worker_config.subpool_numa_map = [numa_node]
+    worker_config.subpool_thread_count = [threads]
+    backend_owner = ext.CPUInfer(worker_config)
+    backend = backend_owner.backend_
+
     # 以下对象和方法均来自现有 ext_bindings.cpp，直接传入同进程 CPU tensor 的指针。
-    backend = ext.WorkerPool(threads)
     config = ext.dense_kvcache.KVCacheConfig(
         layer_num=layers, kv_head_num=kv_heads, q_head_num=q_heads, head_dim=head_dim,
         block_len=block_len, kv_type=ext.kvcache.ggml_type.FP16,
@@ -160,10 +168,11 @@ def main():
     parser.add_argument("--long-context", type=int, default=0, help="额外添加一个指定长度的序列")
     parser.add_argument("--seed", type=int, default=2026)
     parser.add_argument("--device", default="cuda:0", help="FlashAttention 使用的 CUDA 设备")
+    parser.add_argument("--numa-node", type=int, default=0, help="CPU WorkerPool 所在的 NUMA 节点")
     args = parser.parse_args()
     if (any(n <= 0 for n in args.threads) or any(n <= 0 or n % 8 for n in args.block_lens)
-            or args.decode_steps < 0 or args.long_context < 0):
-        parser.error("threads 必须为正，block_len 必须为正的 8 倍数，steps/context 不能为负")
+            or args.decode_steps < 0 or args.long_context < 0 or args.numa_node < 0):
+        parser.error("threads 必须为正，block_len 必须为正的 8 倍数，steps/context/numa-node 不能为负")
     device = torch.device(args.device)
     if device.type != "cuda" or not torch.cuda.is_available():
         raise SystemExit("此对照测试需要 CUDA PyTorch 和支持 FlashAttention 的 GPU。")
@@ -188,7 +197,7 @@ def main():
         for block in args.block_lens:
             for threads in args.threads:
                 for mode in ["random", "zero_lse", "extreme"]:
-                    count += run_case(ext, flash_attn_with_kvcache, device,
+                    count += run_case(ext, flash_attn_with_kvcache, device, args.numa_node,
                                       heads, block, threads, args.decode_steps,
                                       mode, args.seed, args.long_context)
     print(f"PASS: {count} 次检查（FlashAttention / CPU 输出与 LSE、追加长度及空 KV 约定）。", flush=True)
