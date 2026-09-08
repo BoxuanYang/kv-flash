@@ -24,28 +24,29 @@ from test_flash_attention import check_result
 
 REPORT_PATH = Path(__file__).resolve().parents[3] / "large_batch_cpuinfer.txt"
 TABLE_HEADER = (
-    "| Batch | Seq len | Q heads | Block | Threads | Median ms | P95 ms    | Seq/s/layer | Check |"
-)
-TABLE_SEPARATOR = (
-    "|-------|---------|---------|-------|---------|-----------|-----------|-------------|-------|"
+    f"{'Batch':>6} {'Seq':>6} {'Hq':>4} {'Block':>6} {'Threads':>7} "
+    f"{'CPU ms':>10} {'GPU ms':>10} {'CPU/GPU':>9} {'Checks':>8}"
 )
 
 
-def format_result(batch, length, heads, block, threads, median=None, p95=None):
+def format_result(batch, length, heads, block, threads, median=None):
     """One fixed-width result row; failure details belong in the terminal, not the table."""
-    shape = f"| {batch:5} | {length:7} | {heads:7} | {block:5} | {threads:7} |"
-    if median is None:
-        return shape + f" {'--':>9} | {'--':>9} | {'--':>11} | FAIL  |"
-    return shape + f" {median:9.4f} | {p95:9.4f} | {batch * 1000 / median:11.1f} | PASS  |"
+    shape = f"{batch:6} {length:6} {heads:4} {block:6} {threads:7}"
+    cpu_time = "--" if median is None else f"{median:.4f}"
+    status = "FAIL" if median is None else "PASS"
+    # GPU is used for validation only; no GPU timings or ratios are invented.
+    return shape + f" {cpu_time:>10} {'--':>10} {'--':>9} {status:>8}"
+
+
 KV_HEADS = 4
 HEAD_DIM = 128
 
 
 def parse_arguments():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--batch-sizes", type=int, nargs="+", default=[32, 64, 128])
+    parser.add_argument("--batch-sizes", type=int, nargs="+", default=[64, 128])
     parser.add_argument("--sequence-lengths", type=int, nargs="+", default=[128, 4096])
-    parser.add_argument("--threads", type=int, nargs="+", default=[8, 16, 32, 64])
+    parser.add_argument("--threads", type=int, nargs="+", default=[32, 64])
     parser.add_argument("--q-heads", type=int, nargs="+", choices=[32, 64], default=[32])
     parser.add_argument("--block-lens", type=int, nargs="+", default=[128])
     parser.add_argument("--warmup", type=int, default=20)
@@ -208,10 +209,11 @@ def run_experiments(ext, flash_attention, args, log, write_result):
                             torch.testing.assert_close(case.lengths, torch.full_like(case.lengths, length))
                             median = statistics.median(samples)
                             p95 = sorted(samples)[max(0, (95 * len(samples) + 99) // 100 - 1)]
-                            row = format_result(batch, length, heads, block, threads, median, p95)
+                            row = format_result(batch, length, heads, block, threads, median)
                             rows.append(row)
                             write_result(row)
                             log(row)
+                            log(f"P95={p95:.6f} ms; Seq/s/layer={batch * 1000 / median:.1f}")
                             log("Round medians (ms): " + ", ".join(f"{x:.6f}" for x in round_medians))
                         except Exception as error:
                             failures += 1
@@ -224,7 +226,6 @@ def run_experiments(ext, flash_attention, args, log, write_result):
                             case = None
     log("\nFINAL RESULTS")
     log(TABLE_HEADER)
-    log(TABLE_SEPARATOR)
     for row in rows:
         log(row)
     log("恭喜！！正确性测试通过！" if not failures else "测试Fail！！")
@@ -243,7 +244,6 @@ def main():
             print(message, flush=True)
 
         write_result(TABLE_HEADER)
-        write_result(TABLE_SEPARATOR)
 
         log(f"CPU attention performance report: {datetime.now().astimezone().isoformat()}")
         log(f"Host={platform.node()} PID={os.getpid()} PyTorch={torch.__version__}")
@@ -252,6 +252,7 @@ def main():
         log("Affinity diagnostics show allowed nodes, NOT actual KV page residency or memory policy.")
         log("One layer, uniform FP16 inputs, shuffled pages, unchanged Q/K/V reused each iteration.")
         log("Timing excludes setup, KV import/append, GPU validation and tensor transfers.")
+        log("Table: CPU ms is the median; GPU ms and CPU/GPU are -- (not measured).")
         log("Seq/s/layer is batch/latency, not full-model token throughput.")
         try:
             if platform.system() != "Linux":
