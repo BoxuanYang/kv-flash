@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 # coding=utf-8
-"""Profile steady-state CPU decode attention; write results to kv-flash/large_batch_cpuperf.txt.
+"""Profile CPU decode attention; write a results table to kv-flash/large_batch_cpuinfer.txt.
 
 Run from the repository root on Linux:
   numactl --cpunodebind=0 --membind=0 python kt-kernel/test/dense_kvcache/test_cpu_perf.py
@@ -22,7 +22,21 @@ import torch
 from test_flash_attention import check_result
 
 
-REPORT_PATH = Path(__file__).resolve().parents[3] / "large_batch_cpuperf.txt"
+REPORT_PATH = Path(__file__).resolve().parents[3] / "large_batch_cpuinfer.txt"
+TABLE_HEADER = (
+    "| Batch | Seq len | Q heads | Block | Threads | Median ms | P95 ms    | Seq/s/layer | Check |"
+)
+TABLE_SEPARATOR = (
+    "|-------|---------|---------|-------|---------|-----------|-----------|-------------|-------|"
+)
+
+
+def format_result(batch, length, heads, block, threads, median=None, p95=None):
+    """One fixed-width result row; failure details belong in the terminal, not the table."""
+    shape = f"| {batch:5} | {length:7} | {heads:7} | {block:5} | {threads:7} |"
+    if median is None:
+        return shape + f" {'--':>9} | {'--':>9} | {'--':>11} | FAIL  |"
+    return shape + f" {median:9.4f} | {p95:9.4f} | {batch * 1000 / median:11.1f} | PASS  |"
 KV_HEADS = 4
 HEAD_DIM = 128
 
@@ -165,7 +179,7 @@ def describe_affinity():
     return "\n".join(lines)
 
 
-def run_experiments(ext, flash_attention, args, log):
+def run_experiments(ext, flash_attention, args, log, write_result):
     rows = []
     failures = 0
     for batch in args.batch_sizes:
@@ -194,22 +208,23 @@ def run_experiments(ext, flash_attention, args, log):
                             torch.testing.assert_close(case.lengths, torch.full_like(case.lengths, length))
                             median = statistics.median(samples)
                             p95 = sorted(samples)[max(0, (95 * len(samples) + 99) // 100 - 1)]
-                            row = (f"{batch:6} {length:6} {heads:4} {block:6} {threads:7} "
-                                   f"{median:11.6f} {p95:11.6f} {batch * 1000 / median:12.1f} PASS")
+                            row = format_result(batch, length, heads, block, threads, median, p95)
                             rows.append(row)
+                            write_result(row)
                             log(row)
                             log("Round medians (ms): " + ", ".join(f"{x:.6f}" for x in round_medians))
-                            log("Samples (ms): " + ",".join(f"{x:.6f}" for x in samples), terminal=False)
                         except Exception as error:
                             failures += 1
-                            row = f"{label} FAIL: {type(error).__name__}: {error}"
+                            row = format_result(batch, length, heads, block, threads)
                             rows.append(row)
-                            log(row)
+                            write_result(row)
+                            log(f"{label} FAIL: {type(error).__name__}: {error}")
                         finally:
                             # Release this configuration before allocating the next one.
                             case = None
     log("\nFINAL RESULTS")
-    log(" Batch    Seq   Hq  Block Threads   Median ms      P95 ms   Seq/s/layer Check")
+    log(TABLE_HEADER)
+    log(TABLE_SEPARATOR)
     for row in rows:
         log(row)
     log("恭喜！！正确性测试通过！" if not failures else "测试Fail！！")
@@ -220,11 +235,15 @@ def main():
     args = parse_arguments()
     # Each invocation replaces the previous report; flush progress to preserve partial results.
     with REPORT_PATH.open("w", encoding="utf-8") as report:
-        def log(message, terminal=True):
-            report.write(message + "\n")
+        def write_result(row):
+            report.write(row + "\n")
             report.flush()
-            if terminal:
-                print(message, flush=True)
+
+        def log(message):
+            print(message, flush=True)
+
+        write_result(TABLE_HEADER)
+        write_result(TABLE_SEPARATOR)
 
         log(f"CPU attention performance report: {datetime.now().astimezone().isoformat()}")
         log(f"Host={platform.node()} PID={os.getpid()} PyTorch={torch.__version__}")
@@ -244,7 +263,7 @@ def main():
             torch.set_num_threads(1)
             log(f"Extension: {kt_kernel_ext.__file__}")
             with torch.inference_mode():
-                return run_experiments(kt_kernel_ext, flash_attn_with_kvcache, args, log)
+                return run_experiments(kt_kernel_ext, flash_attn_with_kvcache, args, log, write_result)
         except Exception as error:
             log(f"FAIL: {type(error).__name__}: {error}\n测试Fail！！")
             return 1
