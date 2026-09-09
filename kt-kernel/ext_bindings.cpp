@@ -1006,6 +1006,7 @@ PYBIND11_MODULE(kt_kernel_ext, m) {
       .def("profile_reset", &dense::KVCache::profile_reset, py::arg("threads"))
       .def("profile_enable", &dense::KVCache::profile_enable, py::arg("enabled"))
       .def("profile_write", &dense::KVCache::profile_write, py::arg("path"), py::arg("append"))
+      .def("set_parallel_reduce", &dense::KVCache::set_parallel_reduce, py::arg("enabled"))
       .def("get_layer_num", &dense::KVCache::get_layer_num)
       .def("get_kv_head_num", &dense::KVCache::get_kv_head_num)
       .def("get_q_head_num", &dense::KVCache::get_q_head_num)

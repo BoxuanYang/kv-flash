@@ -24,6 +24,9 @@ def main():
     parser.add_argument("--rounds", type=int, default=3)
     parser.add_argument("--seed", type=int, default=2026)
     parser.add_argument("--device", default="cuda:0", help="GPU for correctness checks only")
+    parser.add_argument("--reduce-mode", choices=["two-phase", "locked"], default="two-phase")
+    parser.add_argument("--output", type=Path,
+                        default=Path(__file__).resolve().parents[3] / "cpu_profile.txt")
     args = parser.parse_args()
     if args.warmup < 0 or args.iterations <= 0 or args.rounds <= 0:
         parser.error("warmup must be nonnegative; iterations and rounds must be positive")
@@ -35,13 +38,13 @@ def main():
     from flash_attn import flash_attn_with_kvcache
     from kt_kernel import kt_kernel_ext
 
-    if not hasattr(kt_kernel_ext.dense_kvcache.KVCache, "profile_reset"):
-        raise RuntimeError("Rebuild kt-kernel first: the loaded extension has no profiling methods")
+    if not hasattr(kt_kernel_ext.dense_kvcache.KVCache, "set_parallel_reduce"):
+        raise RuntimeError("Rebuild kt-kernel first: the loaded extension has no reduce mode switch")
     torch.set_num_threads(1)
-    report = Path(__file__).resolve().parents[3] / "cpu_profile.txt"
+    report = args.output.resolve()
     with torch.inference_mode():
         for threads in (32, 64):
-            print(f"Profiling B=64 S=4096 block=128 Hq={args.q_heads} threads={threads}", flush=True)
+            print(f"Profiling B=64 S=4096 block=128 Hq={args.q_heads} threads={threads} reduce={args.reduce_mode}", flush=True)
             # Reuse existing inputs, shuffled physical pages, NUMA-0 pool and GPU reference.
             case = prepare_case(kt_kernel_ext, flash_attn_with_kvcache, args,
                                 64, 4096, args.q_heads, 128, threads)

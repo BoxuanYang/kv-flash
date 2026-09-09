@@ -97,6 +97,8 @@ class KVCache {
   void profile_reset(int threads);
   void profile_enable(bool enabled);
   void profile_write(const char* path, bool append);
+  // 保留原 block task；true 使用无锁的两阶段 reduce，false 使用原带锁归并作对照。
+  void set_parallel_reduce(bool enabled);
 
   /**
    * @brief 调整线程工作区容量，不改变 WorkerPool 的线程数。
@@ -362,6 +364,15 @@ class KVCache {
   double profile_init_time_ = 0.0;
   double profile_pool_time_ = 0.0;
   double profile_output_time_ = 0.0;
+  double profile_reduce_pool_time_ = 0.0;
+  long long profile_reduce_count_[64][16];
+  double profile_reduce_time_[64][16];
+  bool parallel_reduce_ = true;
+  // 每个 block task 独占一个输出槽。容量只在需要增长时调整，后续调用复用。
+  std::vector<float> reduce_block_output_;
+  // 每 task 预留 32 个 float，避免相邻 task 写 LSE 时共享缓存行。
+  std::vector<float> reduce_block_lse_;
+  void reduce_one_query_head_(int task_id);
 
   // 只统计目标配置的最多 64 个线程。每行仅使用 [0]；行间留空，避免伪共享。
   // 同一行只有对应线程写，主线程在线程池完成后读取；不需要统计锁。

@@ -54,6 +54,7 @@ def parse_arguments():
     parser.add_argument("--rounds", type=int, default=3)
     parser.add_argument("--seed", type=int, default=2026)
     parser.add_argument("--device", default="cuda:0", help="GPU used only for correctness validation")
+    parser.add_argument("--reduce-mode", choices=["two-phase", "locked"], default="two-phase")
     parser.add_argument("--pause-before-timing", action="store_true",
                         help="Single configuration only: wait for Enter so perf can attach after setup")
     args = parser.parse_args()
@@ -118,6 +119,7 @@ def prepare_case(ext, flash_attention, args, batch, length, heads, block, thread
         max_block_num=capacity, max_batch_size=batch, max_thread_num=threads,
     )
     cache = ext.dense_kvcache.KVCache(config)
+    cache.set_parallel_reduce(args.reduce_mode == "two-phase")
     past_lengths = torch.zeros(batch, dtype=torch.int32)
     cache.update_kvcache_fp16(
         k_in=keys.data_ptr(), v_in=values.data_ptr(), layer_id=0,

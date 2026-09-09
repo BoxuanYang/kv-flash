@@ -19,6 +19,7 @@ using Half = ggml_fp16_t;
 static Half half(float x) { return GGML_FP32_TO_FP16(x); }
 static float real(Half x) { return GGML_COMPUTE_FP16_TO_FP32(x); }
 static void require(bool ok, const char* message) { if (!ok) throw std::runtime_error(message); }
+static bool test_parallel_reduce = true;
 
 struct Case {
   int heads, block, batch, stride, tokens;
@@ -35,6 +36,7 @@ struct Case {
         table(batch * stride, -1), lengths(lens),
         keys(size_t(batch) * tokens * 4 * 128), values(keys.size()),
         queries(size_t(batch) * h * 128), output(queries.size()), lse(batch * h) {
+    cache.set_parallel_reduce(test_parallel_reduce);
     std::mt19937 rng(83);
     std::uniform_real_distribution<float> dist(-0.5f, 0.5f);
     for (auto& x : keys) x = half(dist(rng));
@@ -134,6 +136,17 @@ template<class F> void expect_error(F f) {
 
 static void correctness() {
   int cases = 0;
+  // 长短序列混合、完整 4096-token 序列和尾块；在同一个 cache 上切换两种 reduce。
+  for (int h = 32; h <= 64; h += 32) {
+    Case long_case(h, 128, 4, {0, 1, 127, 128, 129, 4096});
+    long_case.import(0);
+    for (int mode = 0; mode < 2; ++mode) {
+      long_case.cache.set_parallel_reduce(mode == 0);
+      long_case.attention();
+      long_case.reference();
+    }
+    ++cases;
+  }
   for (int h : {32, 64}) for (int threads : {1, 4}) for (int t : {8, 32, 128}) {
     Case c(h, t, threads, {0, 1, t-1, t, t+1, 2*t, 3*t+7, 0});
     c.import(0); c.import(1);
@@ -229,6 +242,7 @@ static void profile_smoke() {
   for (int threads = 32; threads <= 64; threads += 32) {
     WorkerPool pool(threads, 0);
     dense::KVCache cache(dense::KVCacheConfig(1, 4, 32, 128, 128, GGML_TYPE_F16, 1, 64, threads));
+    cache.set_parallel_reduce(test_parallel_reduce);
     int zero = 0;
     cache.update_kvcache_fp16(keys, values, 0, table, 1, 32, &zero, 128, &pool);
     cache.profile_reset(threads);
@@ -246,13 +260,19 @@ static void profile_smoke() {
       }
     }
     cache.profile_enable(false);
-    cache.profile_write("build/dense_validation/profile_smoke.txt", threads == 64);
+    cache.profile_write(test_parallel_reduce ? "build/dense_validation/profile_smoke.txt"
+                                            : "build/dense_validation/profile_smoke_locked.txt", threads == 64);
   }
   std::cout << "PASS: 32/64-thread profile, reset, warmup exclusion, output and LSE; expected calls=3 tasks=24576 per group\n";
 }
 
 int main(int argc, char** argv) {
   try {
+    if (argc > 1 && std::string(argv[1]) == "--legacy-reduce") {
+      test_parallel_reduce = false;
+      --argc;
+      ++argv;
+    }
     if (argc > 1 && std::string(argv[1]) == "--bench") benchmark();
     else if (argc > 1 && std::string(argv[1]) == "--profile-smoke") profile_smoke();
     else correctness();

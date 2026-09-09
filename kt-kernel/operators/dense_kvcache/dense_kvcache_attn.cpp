@@ -29,7 +29,10 @@ void KVCache::profile_reset(int threads) {
   profile_init_time_ = 0.0;
   profile_pool_time_ = 0.0;
   profile_output_time_ = 0.0;
+  profile_reduce_pool_time_ = 0.0;
   for (int t = 0; t < threads; ++t) {
+    profile_reduce_count_[t][0] = 0;
+    profile_reduce_time_[t][0] = 0.0;
     profile_task_count_[t][0] = 0;
     profile_flush_count_[t][0] = 0;
     profile_qk_time_[t][0] = 0.0;
@@ -53,6 +56,13 @@ void KVCache::profile_enable(bool enabled) {
   profile_enabled_ = enabled;
 }
 
+void KVCache::set_parallel_reduce(bool enabled) {
+  if (profile_enabled_ || profile_calls_ != 0) {
+    throw std::invalid_argument("reset profiling before changing reduce mode");
+  }
+  parallel_reduce_ = enabled;
+}
+
 void KVCache::profile_get_times_(int t, double* times) {
   times[0] = profile_qk_time_[t][0];
   times[1] = profile_softmax_time_[t][0];
@@ -71,6 +81,8 @@ void KVCache::profile_write(const char* path, bool append) {
   profile_enabled_ = false;
   long long tasks = 0;
   long long flushes = 0;
+  long long reduce_tasks = 0;
+  double reduce_time = 0.0;
   double sums[9] = {0.0};
   double max_avg[9] = {0.0};
   const char* names[9] = {"qk", "softmax", "convert", "pv", "merge",
@@ -81,6 +93,8 @@ void KVCache::profile_write(const char* path, bool append) {
     long long count = profile_task_count_[t][0];
     tasks += count;
     flushes += profile_flush_count_[t][0];
+    reduce_tasks += profile_reduce_count_[t][0];
+    reduce_time += profile_reduce_time_[t][0];
     for (int i = 0; i < 9; ++i) {
       sums[i] += times[i];
       if (count > 0 && times[i] / count > max_avg[i]) max_avg[i] = times[i] / count;
@@ -89,6 +103,9 @@ void KVCache::profile_write(const char* path, bool append) {
   if (profile_calls_ == 0 || tasks != profile_calls_ * 64 * 32 * config_.kv_head_num ||
       std::find(thread_local_failed_.begin(), thread_local_failed_.end(), 1) != thread_local_failed_.end()) {
     throw std::runtime_error("profile incomplete: no successful calls or task count mismatch");
+  }
+  if (parallel_reduce_ && (reduce_tasks != profile_calls_ * 64 * config_.q_head_num || flushes != 0)) {
+    throw std::runtime_error("profile incomplete: reduce task count or lock count mismatch");
   }
   FILE* file = fopen(path, append ? "a" : "w");
   if (!file) throw std::runtime_error("cannot open cpu profile report");
@@ -106,21 +123,34 @@ void KVCache::profile_write(const char* path, bool append) {
         "flushes: 实际加锁写回次数；sync/writeback 包含线程结束时的最后一次写回，仍除以 tasks。\n"
         "other: task 与最后一次 flush 的剩余时间，含任务索引、检查和部分计时开销。\n"
         "gap: init 完成到首 task、相邻 task 间、末 task 到 finalize 的间隙；包含取任务和调度延迟。\n"
-        "share_pct: 阶段累计耗时 / 所有阶段累计耗时；并行线程时间之和不是 attention 延迟。\n"
-        "wall/init/pool/output: 每次 attention 的墙钟平均值，分母为 calls，与每 task 平均值分开。\n"
+        "share_pct: 块计算阶段占比，不包含单列的 reduce；并行线程时间之和不是 attention 延迟。\n"
+        "reduce_task = 一个非空 (batch, query head) 的块结果归并，不包含 QK/PV 计算。\n"
+        "reduce_total_ms / reduce_tasks = 每次归并任务平均时间，分母与 block tasks 分开。\n"
+        "reduce_share_pct: reduce 累计线程时间 / (块计算累计线程时间 + reduce 累计线程时间)。\n"
+        "two_phase 模式：块结果直接写独占暂存槽，写入包含在 pv 中；merge/sync/writeback/flushes 为 0。\n"
+        "所有 block 完成后才开始 reduce；同步等待包含在 pool 和 reduce_pool 的墙钟时间中。\n"
+        "wall/init/pool/reduce_pool/output: 每次 attention 的墙钟平均值，分母为 calls。\n"
         "wall: 初始化到 FP16 输出完成；init: 清空输出和任务前缀；pool: 派发到所有线程结束；\n"
-        "output: 工作完成检查、输出 FP16 转换和 LSE 复制。wall 不含输入验证、Python 和文件写入。\n"
+        "reduce_pool: 归并阶段派发到所有线程结束，含调度和等待，locked 模式为 0。\n"
+        "output: 输出 FP16 转换和 LSE 复制。wall 不含输入验证、Python 和文件写入。\n"
         "使用 steady_clock；预热不计入。计时会扰动执行；各阶段包含线程被系统抢占的时间。\n\n");
   }
-  fprintf(file, "B=64  Seq=4096  Block=128  Threads=%d  Hq=%d  Hkv=%d  D=%d\n",
-          profile_threads_, config_.q_head_num, config_.kv_head_num, config_.head_dim);
+  fprintf(file, "B=64  Seq=4096  Block=128  Threads=%d  Hq=%d  Hkv=%d  D=%d  reduce_mode=%s\n",
+          profile_threads_, config_.q_head_num, config_.kv_head_num, config_.head_dim,
+          parallel_reduce_ ? "two_phase" : "locked");
   fprintf(file, "calls=%lld  tasks=%lld  flushes=%lld\n", profile_calls_, tasks, flushes);
-  fprintf(file, "wall_avg_ms=%.6f  init_avg_ms=%.6f  pool_avg_ms=%.6f  output_avg_ms=%.6f\n\n",
+  fprintf(file, "wall_avg_ms=%.6f  init_avg_ms=%.6f  pool_avg_ms=%.6f  reduce_pool_avg_ms=%.6f  output_avg_ms=%.6f\n\n",
           profile_wall_time_ / profile_calls_, profile_init_time_ / profile_calls_,
-          profile_pool_time_ / profile_calls_, profile_output_time_ / profile_calls_);
+          profile_pool_time_ / profile_calls_, profile_reduce_pool_time_ / profile_calls_,
+          profile_output_time_ / profile_calls_);
 
   double total = 0.0;
   for (int i = 0; i < 9; ++i) total += sums[i];
+  fprintf(file, "reduce_tasks=%lld  reduce_total_ms=%.6f  reduce_share_pct=%.2f\n",
+          reduce_tasks, reduce_time, reduce_time * 100.0 / (total + reduce_time));
+  if (reduce_tasks > 0) fprintf(file, "reduce_avg_ms/reduce_task=%.6f\n\n", reduce_time / reduce_tasks);
+  else fprintf(file, "reduce_avg_ms/reduce_task=N/A\n\n");
+  fprintf(file, "块计算阶段（不含单列的 reduce）\n");
   fprintf(file, "%-10s %14s %14s %14s %11s\n", "stage", "total_ms", "avg_ms/task", "max_avg", "share_pct");
   for (int i = 0; i < 9; ++i) {
     fprintf(file, "%-10s %14.6f %14.6f %14.6f %11.2f\n", names[i], sums[i],
@@ -145,13 +175,23 @@ void KVCache::profile_write(const char* path, bool append) {
       fprintf(file, "\n");
     }
   }
+  if (parallel_reduce_) {
+    fprintf(file, "\n每线程 reduce（按实际归并任务数平均）\n");
+    fprintf(file, "%6s %14s %16s %20s\n", "thread", "reduce_tasks", "reduce_total_ms", "avg_ms/reduce_task");
+    for (int t = 0; t < profile_threads_; ++t) {
+      long long count = profile_reduce_count_[t][0];
+      fprintf(file, "%6d %14lld %16.6f", t, count, profile_reduce_time_[t][0]);
+      if (count > 0) fprintf(file, " %20.6f\n", profile_reduce_time_[t][0] / count);
+      else fprintf(file, " %20s\n", "N/A");
+    }
+  }
   fprintf(file, "\n--------------------------------------------------------------------------\n\n");
   int failed = ferror(file);
   if (fclose(file) != 0) failed = 1;
   if (failed) throw std::runtime_error("cannot write cpu profile report");
 }
 
-// 一个任务仍处理一个 (batch, KV head, block)。先线程内累计，切换 head 或结束时再带锁提交。
+// 两种 reduce 路径使用完全相同的 (batch, KV head, block) task 和任务领取方式。
 void KVCache::attention_kvhead_(const ggml_fp16_t* q_in, ggml_fp16_t* output,
                               float* attn_lse, int batch_size, WorkerPool* backend) {
   const int head_dim = config_.head_dim;
@@ -231,16 +271,33 @@ void KVCache::attention_kvhead_(const ggml_fp16_t* q_in, ggml_fp16_t* output,
           const int valid_tokens = std::min(block_len, cache_seqlens_[batch_id] - block_id * block_len);
           auto& block_output = thread_local_output_fp32_[thread_id];
           auto& block_lse = thread_local_attn_lse_[thread_id];
+          float* block_output_data = block_output.data();
+          float* block_lse_data = block_lse.data();
+          if (parallel_reduce_) {
+            block_output_data = reduce_block_output_.data() + size_t(task_id) * output_size;
+            block_lse_data = reduce_block_lse_.data() + size_t(task_id) * 32;
+          }
           const bool ok = attn_with_kvcache_one_block_(
               head_dim, n_gqa_, q_in + (size_t(batch_id) * config_.kv_head_num + head_id) * output_size,
               block_len, valid_tokens,
               k_cache_fp16_[layer_id_][head_id][block_idx].data(),
               v_cache_fp16_[layer_id_][head_id][block_idx].data(),
-              thread_local_attn_score_[thread_id].data(), block_output.data(), block_lse.data(),
+              thread_local_attn_score_[thread_id].data(), block_output_data, block_lse_data,
               thread_local_probability_fp16_[thread_id].data());
           if (!ok) {
             // 不从工作线程抛异常；所有线程完成后，由调用线程报告错误。
             thread_local_failed_[thread_id] = 1;
+            return;
+          }
+
+          if (parallel_reduce_) {
+            // PV 已直接写入该 task 的独占槽，不需要复制、在线 merge 或获取输出锁。
+            if (profile_enabled_) {
+              double end = profile_now_ms();
+              profile_task_time_[thread_id][0] += end - task_start;
+              ++profile_task_count_[thread_id][0];
+              profile_last_end_[thread_id][0] = end;
+            }
             return;
           }
 
@@ -282,20 +339,29 @@ void KVCache::attention_kvhead_(const ggml_fp16_t* q_in, ggml_fp16_t* output,
             start = profile_now_ms();
             profile_gap_time_[thread_id][0] += start - profile_last_end_[thread_id][0];
           }
-          flush_thread_result(thread_id);
+          if (!parallel_reduce_) flush_thread_result(thread_id);
           if (profile_enabled_) {
             profile_final_flush_time_[thread_id][0] += profile_now_ms() - start;
           }
         });
   }
-  double output_start = 0.0;
   if (profile_enabled_) {
-    output_start = profile_now_ms();
-    profile_pool_time_ += output_start - pool_start;
+    profile_pool_time_ += profile_now_ms() - pool_start;
   }
   if (std::find(thread_local_failed_.begin(), thread_local_failed_.end(), 1) != thread_local_failed_.end()) {
     throw std::runtime_error("Dense attention failed: invalid physical block or unsupported FP16 GEMM");
   }
+
+  // 上面的同步任务池调用已经等所有 block 完成；失败时不会读取未完成的块结果。
+  if (parallel_reduce_ && task_offsets_[batch_size] > 0) {
+    double reduce_start = 0.0;
+    if (profile_enabled_) reduce_start = profile_now_ms();
+    backend->do_work_stealing_job(batch_size * config_.q_head_num,
+        [&](int task_id) { reduce_one_query_head_(task_id); });
+    if (profile_enabled_) profile_reduce_pool_time_ += profile_now_ms() - reduce_start;
+  }
+  double output_start = 0.0;
+  if (profile_enabled_) output_start = profile_now_ms();
 
   // 空序列输出为 0、LSE 为 -inf。输出在此转为 FP16，LSE 始终为 FP32。
   for (int b = 0; b < batch_size; ++b) {
@@ -308,6 +374,43 @@ void KVCache::attention_kvhead_(const ggml_fp16_t* q_in, ggml_fp16_t* output,
     }
   }
   if (profile_enabled_) profile_output_time_ += profile_now_ms() - output_start;
+}
+
+// 每个 reduce task 独占一个 query head 的输出，动态领取；不进行 QK/PV 计算。
+void KVCache::reduce_one_query_head_(int task_id) {
+  int batch_id = task_id / config_.q_head_num;
+  int query_head = task_id % config_.q_head_num;
+  int head_id = query_head / n_gqa_;
+  int group_id = query_head % n_gqa_;
+  int blocks = (task_offsets_[batch_id + 1] - task_offsets_[batch_id]) / config_.kv_head_num;
+  if (blocks == 0) return;  // 初始化已将空序列输出设为 0、LSE 设为 -inf。
+  double start = 0.0;
+  if (profile_enabled_) start = profile_now_ms();
+  int first = task_offsets_[batch_id] + head_id * blocks;
+  int head_dim = config_.head_dim;
+  int output_size = n_gqa_ * head_dim;
+  float* dst = output_fp32_[batch_id][head_id].data() + group_id * head_dim;
+
+  // 用各块 LSE 的稳定 softmax 作为块输出权重。只读暂存结果，不修改其他 task 的数据。
+  float max_lse = reduce_block_lse_[size_t(first) * 32 + group_id];
+  for (int b = 1; b < blocks; ++b) {
+    float value = reduce_block_lse_[size_t(first + b) * 32 + group_id];
+    if (value > max_lse) max_lse = value;
+  }
+  float sum = 0.0f;
+  for (int b = 0; b < blocks; ++b) {
+    float weight = std::exp(reduce_block_lse_[size_t(first + b) * 32 + group_id] - max_lse);
+    const float* src = reduce_block_output_.data() + size_t(first + b) * output_size + group_id * head_dim;
+    sum += weight;
+    for (int d = 0; d < head_dim; ++d) dst[d] += weight * src[d];
+  }
+  for (int d = 0; d < head_dim; ++d) dst[d] /= sum;
+  attn_lse_[batch_id][head_id][group_id] = max_lse + std::log(sum);
+  if (profile_enabled_) {
+    int thread_id = WorkerPool::thread_local_id;
+    profile_reduce_time_[thread_id][0] += profile_now_ms() - start;
+    ++profile_reduce_count_[thread_id][0];
+  }
 }
 
 // 在原有 batch 循环内构建任务前缀和，不分配临时任务对象。
@@ -331,6 +434,12 @@ void KVCache::attn_initialize_kvhead_(int batch_size, int layer_idx, const int* 
       std::fill(output_fp32_[b][h].begin(), output_fp32_[b][h].end(), 0.0f);
       std::fill(attn_lse_[b][h].begin(), attn_lse_[b][h].end(), -std::numeric_limits<float>::infinity());
     }
+  }
+  if (parallel_reduce_) {
+    size_t output_count = size_t(task_offsets_[batch_size]) * n_gqa_ * config_.head_dim;
+    size_t lse_count = size_t(task_offsets_[batch_size]) * 32;
+    if (reduce_block_output_.size() < output_count) reduce_block_output_.resize(output_count);
+    if (reduce_block_lse_.size() < lse_count) reduce_block_lse_.resize(lse_count);
   }
 }
 
