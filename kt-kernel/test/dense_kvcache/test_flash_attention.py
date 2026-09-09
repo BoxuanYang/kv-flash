@@ -22,7 +22,7 @@ head_dim = 128
 
 q_head_num_list = [32]
 block_len_list = [128]
-thread_num_list = [64]
+thread_num_list = [32, 64]
 batch_size_list = [16, 32]
 sequence_length_list = [1024, 2048, 3072]
 warmup_iterations = 2
