@@ -100,7 +100,7 @@ void KVCache::profile_write(const char* path, bool append) {
       if (count > 0 && times[i] / count > max_avg[i]) max_avg[i] = times[i] / count;
     }
   }
-  if (profile_calls_ == 0 || tasks != profile_calls_ * 64 * 32 * config_.kv_head_num ||
+  if (profile_calls_ == 0 || tasks != profile_calls_ * 64 * (32 / kBlocksPerTask) * config_.kv_head_num ||
       std::find(thread_local_failed_.begin(), thread_local_failed_.end(), 1) != thread_local_failed_.end()) {
     throw std::runtime_error("profile incomplete: no successful calls or task count mismatch");
   }
@@ -112,22 +112,22 @@ void KVCache::profile_write(const char* path, bool append) {
   if (!append) {
     fprintf(file,
         "CPU decode attention profile | 时间单位全部为 ms\n"
-        "task = 一个 (batch, KV head, block)；tasks = 该线程实际完成的 task 次数。\n"
+        "task = 同一 (batch, KV head) 的最多 4 个连续逻辑 block；tasks = 该线程实际完成的 task 次数。\n"
         "total_ms = 累计耗时；avg_ms/task = 累计耗时 / 该线程 tasks。无 task 显示 N/A。\n"
         "汇总 avg_ms/task = 全线程累计耗时 / 全线程 tasks；max_avg = 各线程平均值的最大值。\n"
         "qk: QK GEMM。softmax: 缩放、稳定 softmax、LSE 和尾块清零。\n"
         "convert: 概率矩阵 FP32 转 FP16。pv: PV GEMM。\n"
-        "merge: 线程本地输出/LSE 合并，或切换 head 后复制新结果。\n"
+        "merge: task 内 block 归并、结果复制及 locked 模式的线程本地累计。\n"
         "sync: 输出写回前获取 mutex 的等待时间，包含 lock 调用开销。\n"
         "writeback: 获得 mutex 后的全局输出/LSE 合并与写回，包含解锁。\n"
         "flushes: 实际加锁写回次数；sync/writeback 包含线程结束时的最后一次写回，仍除以 tasks。\n"
         "other: task 与最后一次 flush 的剩余时间，含任务索引、检查和部分计时开销。\n"
         "gap: init 完成到首 task、相邻 task 间、末 task 到 finalize 的间隙；包含取任务和调度延迟。\n"
         "share_pct: 块计算阶段占比，不包含单列的 reduce；并行线程时间之和不是 attention 延迟。\n"
-        "reduce_task = 一个非空 (batch, query head) 的块结果归并，不包含 QK/PV 计算。\n"
-        "reduce_total_ms / reduce_tasks = 每次归并任务平均时间，分母与 block tasks 分开。\n"
+        "reduce_task = 一个非空 (batch, query head) 的 task 结果归并，不包含 QK/PV 计算。\n"
+        "reduce_total_ms / reduce_tasks = 每次归并任务平均时间，分母与四块计算 tasks 分开。\n"
         "reduce_share_pct: reduce 累计线程时间 / (块计算累计线程时间 + reduce 累计线程时间)。\n"
-        "two_phase 模式：块结果直接写独占暂存槽，写入包含在 pv 中；merge/sync/writeback/flushes 为 0。\n"
+        "two_phase 模式：task 内先归并，再复制到独占暂存槽，计入 merge；sync/writeback/flushes 为 0。\n"
         "所有 block 完成后才开始 reduce；同步等待包含在 pool 和 reduce_pool 的墙钟时间中。\n"
         "wall/init/pool/reduce_pool/output: 每次 attention 的墙钟平均值，分母为 calls。\n"
         "wall: 初始化到 FP16 输出完成；init: 清空输出和任务前缀；pool: 派发到所有线程结束；\n"
@@ -135,8 +135,8 @@ void KVCache::profile_write(const char* path, bool append) {
         "output: 输出 FP16 转换和 LSE 复制。wall 不含输入验证、Python 和文件写入。\n"
         "使用 steady_clock；预热不计入。计时会扰动执行；各阶段包含线程被系统抢占的时间。\n\n");
   }
-  fprintf(file, "B=64  Seq=4096  Block=128  Threads=%d  Hq=%d  Hkv=%d  D=%d  reduce_mode=%s\n",
-          profile_threads_, config_.q_head_num, config_.kv_head_num, config_.head_dim,
+  fprintf(file, "B=64  Seq=4096  Block=128  Threads=%d  Hq=%d  Hkv=%d  D=%d  BlocksPerTask=%d  reduce_mode=%s\n",
+          profile_threads_, config_.q_head_num, config_.kv_head_num, config_.head_dim, kBlocksPerTask,
           parallel_reduce_ ? "two_phase" : "locked");
   fprintf(file, "calls=%lld  tasks=%lld  flushes=%lld\n", profile_calls_, tasks, flushes);
   fprintf(file, "wall_avg_ms=%.6f  init_avg_ms=%.6f  pool_avg_ms=%.6f  reduce_pool_avg_ms=%.6f  output_avg_ms=%.6f\n\n",
@@ -191,7 +191,7 @@ void KVCache::profile_write(const char* path, bool append) {
   if (failed) throw std::runtime_error("cannot write cpu profile report");
 }
 
-// 两种 reduce 路径使用完全相同的 (batch, KV head, block) task 和任务领取方式。
+// 两种 reduce 路径均以同一 (batch, KV head) 的最多四个连续逻辑 block 为 task。
 void KVCache::attention_kvhead_(const ggml_fp16_t* q_in, ggml_fp16_t* output,
                               float* attn_lse, int batch_size, WorkerPool* backend) {
   const int head_dim = config_.head_dim;
@@ -258,76 +258,78 @@ void KVCache::attention_kvhead_(const ggml_fp16_t* q_in, ggml_fp16_t* output,
           // 重复前缀对应空序列，由 upper_bound 自动跳过。
           const int batch_id = int(std::upper_bound(task_offsets_.begin(),
               task_offsets_.begin() + batch_size + 1, task_id) - task_offsets_.begin()) - 1;
-          const int blocks = (task_offsets_[batch_id + 1] - task_offsets_[batch_id]) / config_.kv_head_num;
+          const int chunks = (task_offsets_[batch_id + 1] - task_offsets_[batch_id]) / config_.kv_head_num;
           const int local_id = task_id - task_offsets_[batch_id];
-          const int head_id = local_id / blocks;
-          const int block_id = local_id % blocks;
-          // 有效 block 数与 block 表行步长是两个不同的量。
-          const int block_idx = block_table_[size_t(batch_id) * block_num_per_seq_ + block_id];
-          if (block_idx < 0 || block_idx >= config_.max_block_num) {
-            thread_local_failed_[thread_id] = 1;
-            return;
-          }
-          const int valid_tokens = std::min(block_len, cache_seqlens_[batch_id] - block_id * block_len);
-          auto& block_output = thread_local_output_fp32_[thread_id];
-          auto& block_lse = thread_local_attn_lse_[thread_id];
-          float* block_output_data = block_output.data();
-          float* block_lse_data = block_lse.data();
-          if (parallel_reduce_) {
-            block_output_data = reduce_block_output_.data() + size_t(task_id) * output_size;
-            block_lse_data = reduce_block_lse_.data() + size_t(task_id) * 32;
-          }
-          const bool ok = attn_with_kvcache_one_block_(
-              head_dim, n_gqa_, q_in + (size_t(batch_id) * config_.kv_head_num + head_id) * output_size,
-              block_len, valid_tokens,
-              k_cache_fp16_[layer_id_][head_id][block_idx].data(),
-              v_cache_fp16_[layer_id_][head_id][block_idx].data(),
-              thread_local_attn_score_[thread_id].data(), block_output_data, block_lse_data,
-              thread_local_probability_fp16_[thread_id].data());
-          if (!ok) {
-            // 不从工作线程抛异常；所有线程完成后，由调用线程报告错误。
-            thread_local_failed_[thread_id] = 1;
-            return;
-          }
-
-          if (parallel_reduce_) {
-            // PV 已直接写入该 task 的独占槽，不需要复制、在线 merge 或获取输出锁。
-            if (profile_enabled_) {
-              double end = profile_now_ms();
-              profile_task_time_[thread_id][0] += end - task_start;
-              ++profile_task_count_[thread_id][0];
-              profile_last_end_[thread_id][0] = end;
+          const int head_id = local_id / chunks;
+          const int chunk_id = local_id % chunks;
+          const int len = cache_seqlens_[batch_id];
+          const int blocks = len / block_len + (len % block_len != 0);
+          const int block_begin = chunk_id * kBlocksPerTask;
+          const int block_end = block_begin + std::min(kBlocksPerTask, blocks - block_begin);
+          for (int block_id = block_begin; block_id < block_end; ++block_id) {
+            // 有效 block 数与 block 表行步长是两个不同的量。
+            const int block_idx = block_table_[size_t(batch_id) * block_num_per_seq_ + block_id];
+            if (block_idx < 0 || block_idx >= config_.max_block_num) {
+              thread_local_failed_[thread_id] = 1;
+              return;
             }
-            return;
-          }
-
-          const auto [cur_batch_id, cur_head_id] = thread_cur_head_idx_[thread_id];
-          double merge_start = 0.0;
-          if (profile_enabled_) merge_start = profile_now_ms();
-          auto& cur_output = thread_local_cur_output_fp32_[thread_id];
-          auto& cur_lse = thread_local_cur_attn_lse_[thread_id];
-          if (batch_id == cur_batch_id && head_id == cur_head_id) {
-            // 保留线程内归并，只修正 LSE 公式的溢出问题。
-            for (int i = 0; i < n_gqa_; ++i) {
-              const float hi = std::max(cur_lse[i], block_lse[i]);
-              const float lo = std::min(cur_lse[i], block_lse[i]);
-              const float merged_lse = hi + std::log(1.0 + std::exp(lo - hi));
-              ggml_vec_scale_f32(head_dim, cur_output.data() + i * head_dim, std::exp(cur_lse[i] - merged_lse));
-              ggml_vec_scale_f32(head_dim, block_output.data() + i * head_dim, std::exp(block_lse[i] - merged_lse));
-              for (int j = 0; j < head_dim; ++j) cur_output[i * head_dim + j] += block_output[i * head_dim + j];
-              cur_lse[i] = merged_lse;
+            const int valid_tokens = std::min(block_len, cache_seqlens_[batch_id] - block_id * block_len);
+            auto& block_output = thread_local_output_fp32_[thread_id];
+            auto& block_lse = thread_local_attn_lse_[thread_id];
+            float* block_output_data = block_output.data();
+            float* block_lse_data = block_lse.data();
+            const bool ok = attn_with_kvcache_one_block_(
+                head_dim, n_gqa_, q_in + (size_t(batch_id) * config_.kv_head_num + head_id) * output_size,
+                block_len, valid_tokens,
+                k_cache_fp16_[layer_id_][head_id][block_idx].data(),
+                v_cache_fp16_[layer_id_][head_id][block_idx].data(),
+                thread_local_attn_score_[thread_id].data(), block_output_data, block_lse_data,
+                thread_local_probability_fp16_[thread_id].data());
+            if (!ok) {
+              // 不从工作线程抛异常；所有线程完成后，由调用线程报告错误。
+              thread_local_failed_[thread_id] = 1;
+              return;
             }
-          } else {
-            flush_thread_result(thread_id);
-            // flush 已单独计入 sync/writeback，不重复计入本地 merge。
+
+            const auto [cur_batch_id, cur_head_id] = thread_cur_head_idx_[thread_id];
+            double merge_start = 0.0;
             if (profile_enabled_) merge_start = profile_now_ms();
-            thread_cur_head_idx_[thread_id] = {batch_id, head_id};
-            std::copy(block_output.begin(), block_output.end(), cur_output.begin());
-            std::copy(block_lse.begin(), block_lse.end(), cur_lse.begin());
+            auto& cur_output = thread_local_cur_output_fp32_[thread_id];
+            auto& cur_lse = thread_local_cur_attn_lse_[thread_id];
+            if (parallel_reduce_ ? block_id != block_begin
+                                : batch_id == cur_batch_id && head_id == cur_head_id) {
+              // two_phase 每个 task 独立累计；locked 还可累计同一 head 的后续 task。
+              for (int i = 0; i < n_gqa_; ++i) {
+                const float hi = std::max(cur_lse[i], block_lse[i]);
+                const float lo = std::min(cur_lse[i], block_lse[i]);
+                const float merged_lse = hi + std::log(1.0 + std::exp(lo - hi));
+                ggml_vec_scale_f32(head_dim, cur_output.data() + i * head_dim, std::exp(cur_lse[i] - merged_lse));
+                ggml_vec_scale_f32(head_dim, block_output.data() + i * head_dim, std::exp(block_lse[i] - merged_lse));
+                for (int j = 0; j < head_dim; ++j) cur_output[i * head_dim + j] += block_output[i * head_dim + j];
+                cur_lse[i] = merged_lse;
+              }
+            } else {
+              if (!parallel_reduce_) flush_thread_result(thread_id);
+              // flush 已单独计入 sync/writeback，不重复计入本地 merge。
+              if (profile_enabled_) merge_start = profile_now_ms();
+              thread_cur_head_idx_[thread_id] = {batch_id, head_id};
+              std::copy(block_output.begin(), block_output.end(), cur_output.begin());
+              std::copy(block_lse.begin(), block_lse.end(), cur_lse.begin());
+            }
+            if (profile_enabled_) profile_merge_time_[thread_id][0] += profile_now_ms() - merge_start;
+          }
+          if (parallel_reduce_) {
+            // task 内先归并，只有完整成功的 task 才提交一份独占结果。
+            double merge_start = 0.0;
+            if (profile_enabled_) merge_start = profile_now_ms();
+            std::copy_n(thread_local_cur_output_fp32_[thread_id].data(), output_size,
+                        reduce_task_output_.data() + size_t(task_id) * output_size);
+            std::copy_n(thread_local_cur_attn_lse_[thread_id].data(), n_gqa_,
+                        reduce_task_lse_.data() + size_t(task_id) * 32);
+            if (profile_enabled_) profile_merge_time_[thread_id][0] += profile_now_ms() - merge_start;
           }
           if (profile_enabled_) {
             double end = profile_now_ms();
-            profile_merge_time_[thread_id][0] += end - merge_start;
             profile_task_time_[thread_id][0] += end - task_start;
             ++profile_task_count_[thread_id][0];
             profile_last_end_[thread_id][0] = end;
@@ -382,25 +384,25 @@ void KVCache::reduce_one_query_head_(int task_id) {
   int query_head = task_id % config_.q_head_num;
   int head_id = query_head / n_gqa_;
   int group_id = query_head % n_gqa_;
-  int blocks = (task_offsets_[batch_id + 1] - task_offsets_[batch_id]) / config_.kv_head_num;
-  if (blocks == 0) return;  // 初始化已将空序列输出设为 0、LSE 设为 -inf。
+  int chunks = (task_offsets_[batch_id + 1] - task_offsets_[batch_id]) / config_.kv_head_num;
+  if (chunks == 0) return;  // 初始化已将空序列输出设为 0、LSE 设为 -inf。
   double start = 0.0;
   if (profile_enabled_) start = profile_now_ms();
-  int first = task_offsets_[batch_id] + head_id * blocks;
+  int first = task_offsets_[batch_id] + head_id * chunks;
   int head_dim = config_.head_dim;
   int output_size = n_gqa_ * head_dim;
   float* dst = output_fp32_[batch_id][head_id].data() + group_id * head_dim;
 
-  // 用各块 LSE 的稳定 softmax 作为块输出权重。只读暂存结果，不修改其他 task 的数据。
-  float max_lse = reduce_block_lse_[size_t(first) * 32 + group_id];
-  for (int b = 1; b < blocks; ++b) {
-    float value = reduce_block_lse_[size_t(first + b) * 32 + group_id];
+  // 用各 task LSE 的稳定 softmax 作为 task 输出权重。只读暂存结果，不修改其他 task 的数据。
+  float max_lse = reduce_task_lse_[size_t(first) * 32 + group_id];
+  for (int b = 1; b < chunks; ++b) {
+    float value = reduce_task_lse_[size_t(first + b) * 32 + group_id];
     if (value > max_lse) max_lse = value;
   }
   float sum = 0.0f;
-  for (int b = 0; b < blocks; ++b) {
-    float weight = std::exp(reduce_block_lse_[size_t(first + b) * 32 + group_id] - max_lse);
-    const float* src = reduce_block_output_.data() + size_t(first + b) * output_size + group_id * head_dim;
+  for (int b = 0; b < chunks; ++b) {
+    float weight = std::exp(reduce_task_lse_[size_t(first + b) * 32 + group_id] - max_lse);
+    const float* src = reduce_task_output_.data() + size_t(first + b) * output_size + group_id * head_dim;
     sum += weight;
     for (int d = 0; d < head_dim; ++d) dst[d] += weight * src[d];
   }
@@ -425,7 +427,8 @@ void KVCache::attn_initialize_kvhead_(int batch_size, int layer_idx, const int* 
     if (len < 0) throw std::invalid_argument("cache_seqlens must be nonnegative");
     const int blocks = len / config_.block_len + (len % config_.block_len != 0);
     if (blocks > block_table_stride) throw std::invalid_argument("block table is too short");
-    const int64_t tasks = int64_t(task_offsets_[b]) + int64_t(blocks) * config_.kv_head_num;
+    const int chunks = blocks / kBlocksPerTask + (blocks % kBlocksPerTask != 0);
+    const int64_t tasks = int64_t(task_offsets_[b]) + int64_t(chunks) * config_.kv_head_num;
     if (tasks > std::numeric_limits<int>::max()) throw std::overflow_error("too many attention tasks");
     task_offsets_[b + 1] = int(tasks);
     cache_seqlens_[b] = len;
@@ -438,8 +441,8 @@ void KVCache::attn_initialize_kvhead_(int batch_size, int layer_idx, const int* 
   if (parallel_reduce_) {
     size_t output_count = size_t(task_offsets_[batch_size]) * n_gqa_ * config_.head_dim;
     size_t lse_count = size_t(task_offsets_[batch_size]) * 32;
-    if (reduce_block_output_.size() < output_count) reduce_block_output_.resize(output_count);
-    if (reduce_block_lse_.size() < lse_count) reduce_block_lse_.resize(lse_count);
+    if (reduce_task_output_.size() < output_count) reduce_task_output_.resize(output_count);
+    if (reduce_task_lse_.size() < lse_count) reduce_task_lse_.resize(lse_count);
   }
 }
 

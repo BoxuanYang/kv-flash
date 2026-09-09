@@ -17,7 +17,7 @@ K/V/query/output 使用 FP16，score、单块输出、累计输出和 LSE 使用
 1. `attn_with_kvcache()`：追加一个 token，然后调用 `attn()`。
 2. `attn()`：检查 decode 调用参数，初始化状态，再执行并行计算。
 3. `attn_initialize_kvhead_()`：重置结果，构建有效任务前缀和。
-4. `attention_kvhead_()`：领取 block 任务，计算单块、线程内归并、带锁提交。
+4. `attention_kvhead_()`：领取四块任务、任务内归并，再执行两阶段 reduce（默认）或带锁提交。
 5. `attn_with_kvcache_one_block_()`：QK、稳定 softmax、FP16 probability、PV。
 6. `ThreadResize()` / `BatchResize()` / `BlockResize()`：预分配工作区和缓存。
 
@@ -44,43 +44,47 @@ generate_token_idx 不参与计算；两个 attention 入口均在 Release 构�
 ## 有效任务编号：attention_kvhead_()
 
 设序列 b 的有效 block 数为 `N[b] = ceil(cache_seqlens[b] / block_len)`。
-前缀数组为：
+每个 head 的任务数为 `C[b] = ceil(N[b] / 4)`，前缀数组为：
 
 ```text
 task_offsets[0] = 0
-task_offsets[b+1] = task_offsets[b] + 4 * N[b]
+task_offsets[b+1] = task_offsets[b] + kv_head_num * C[b]
 ```
 
-任务仍按 `(batch, KV head, logical block)` 排列，任务数为 `4 * sum(N)`。
-通过 upper_bound 查出 batch，再用该序列的 N 解出 head/block。
+任务按 `(batch, KV head, 四块分组)` 排列，任务数为 `kv_head_num * sum(C)`。
+通过 upper_bound 查出 batch，再用该序列的 C 解出 head/分组。
+每组处理 `[4 * group, min(4 * group + 4, N[b]))` 的逻辑 block；不会跨 sequence/head。
+逻辑连续不要求物理页连续，每个 block 单独查表、检查物理页范围并调用原 GEMM。
 访问 block_table 时仍使用原表行步长，不使用 N。
 空序列没有任务；整个 batch 都为空时不调用线程池。
 
-这只去掉表中未使用槽位对应的任务。长序列仍会拆成多个 block 任务，由多个线程动态领取。
+长序列拆成多个四块任务，由多个线程动态领取；尾任务允许只有 1～3 个 block。
 当前 WorkerPool 的这条接口只使用第 0 个子池；容量检查也据此读取该子池配置。
 
 ## 单块输出与同步
 
-`attn_with_kvcache_one_block_()` 的 output 指向 `thread_local_output_fp32_[thread_id]`。
-PV GEMM 直接写入该缓冲区，删除原先 draft 中的 FP32 sum 及 sum -> output 复制。
-FP16 probability 使用独立、具名的线程数组。
+单块 kernel 仍使用线程私有的 FP32 输出/LSE 和 FP16 probability 工作区。
+同一 task 的最多 4 个 block 使用稳定 LSE 合并公式在本地累计，不改变物理 block 大小或 GEMM。
+
+默认 `set_parallel_reduce(true)` 路径：
 
 ```text
-单块 kernel -> thread_local_output_fp32_
-                    |
-                    | 线程内归并
-                    v
-           thread_local_cur_output_fp32_
-                    |
-                    | 切换 batch/head 或线程结束：flush_thread_result()
-                    v
-           output_fp32_[batch][head]（同一 mutex 保护）
+最多四次单块 kernel -> 线程私有累计 O/LSE -> 每 task 一份独占暂存结果
+                                               |
+                                      所有计算 task 完成
+                                               v
+                           每个 (batch, query head) 独占输出的 reduce
+                                               |
+                                      最终 FP16 输出转换
 ```
 
-线程累计输出与单块输出仍是两块独立内存。提交 lambda 合并了两个位置的重复代码，
-没有改变锁的对象、粒度或逻辑提交条件。压紧任务编号会改变实际线程领取顺序，
-因此不要求多线程结果逐位一致。
-同一个 KVCache / WorkerPool 仍不支持重叠调用；Resize 也必须在没有计算时执行。
+只有完整成功的 task 才复制结果到暂存槽；任意 block 的物理页非法或 GEMM 失败时，
+主线程等待计算结束后抛错，不启动 reduce。空序列输出为零、LSE 为负无穷。
+
+`set_parallel_reduce(false)` 使用相同四块 task，保留同一线程连续领取同一 head 时的累计；
+切换 batch/head 或线程退出时，使用该 head 的 mutex 提交结果。
+两种模式都保留单块和累计结果的独立工作区，多线程结果不要求逐位一致。
+同一个 KVCache / WorkerPool 不支持重叠调用；Resize 必须在没有计算时执行。
 
 ## 单独的正确性修复
 
@@ -109,7 +113,7 @@ bash kt-kernel/test/dense_kvcache/run.sh release --bench
 ```
 
 测试使用本仓库的 AVX2 GEMM（含 IQK 分派）和真实 WorkerPool，参考值为完整序列 FP64 attention。
-检查 GQA=8/16、1/4 线程、block_len=8/32/128、异长/空序列、随机物理映射、边界尾块、
+检查 GQA=8/16、1/4 线程、block_len=8/32/128、异长/空序列、随机物理映射、四块分组边界、1～3 块尾任务、部分有效尾块、
 跨两层连续追加、合法 LSE=0、极端 score、错误恢复和容量变化。
 输出容差为 `0.002 + 0.002 * abs(reference)`，LSE 绝对容差 0.004；
 包含原实现就存在的 probability FP16 舍入误差。
@@ -144,7 +148,17 @@ python kt-kernel/test/dense_kvcache/test_flash_attention.py --threads 1 4 --bloc
 本地仅完成该 Python 脚本的语法和命令行检查；当前可用 PyTorch 为 CPU 版本，
 尚未运行 FlashAttention 与 pybind 的端到端对照。下文 C++ 验证结果不代表此项对照已通过。
 
-## 本次验证结果（2026-09-07）
+## 四块任务验证（2026-09-09）
+
+在 WSL Ubuntu 使用真实 AVX2 GEMM 和 WorkerPool 验证：two-phase / locked 两种模式
+均通过 Release 和 ASan/UBSan 的 20 组场景及额外错误恢复检查。
+覆盖完整四块任务、1～3 块尾任务、部分有效尾块、空序列、随机物理页映射、
+任务中途遇到负数/越界物理页后的失败恢复，以及跨任务的极端 score 和 FP64 参考对照。
+两种模式的 32/64 线程 profiling smoke test 均通过；每组 3 次调用共 6144 个计算 task，
+two-phase 模式另有 6144 个 reduce task，flush 为 0。
+这次未测目标服务器长上下文性能，以下旧版性能数据不代表四块任务版本的加速比。
+
+## 历史验证结果（2026-09-07）
 
 本机 WSL Ubuntu、Intel i9-13900HX，使用 AVX2/FMA/F16C，不依赖 BF16。
 Release 使用 `-O3 -ffast-math`；独立 FP64 参考检查不启用 fast-math。

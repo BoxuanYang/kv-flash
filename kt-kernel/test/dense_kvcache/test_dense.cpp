@@ -148,7 +148,9 @@ static void correctness() {
     ++cases;
   }
   for (int h : {32, 64}) for (int threads : {1, 4}) for (int t : {8, 32, 128}) {
-    Case c(h, t, threads, {0, 1, t-1, t, t+1, 2*t, 3*t+7, 0});
+    // Exercise 1/2/3-block tail tasks, exact four-block boundaries and partial tail blocks.
+    Case c(h, t, threads, {0, 1, t-1, t, t+1, 2*t, 3*t+7, 4*t-1, 4*t,
+                          4*t+1, 5*t, 6*t, 7*t, 8*t, 8*t+1, 0});
     c.import(0); c.import(1);
     c.attention(); c.reference();
     for (int i = 0; i < 3; ++i) c.append();
@@ -159,7 +161,7 @@ static void correctness() {
     ++cases;
   }
   for (int h : {32, 64}) for (bool large : {false, true}) {
-    Case c(h, 32, 4, {64, 65, 96, 1});
+    Case c(h, 32, 4, {64, 65, 96, 128, 129, 256, 257, 1});
     std::fill(c.queries.begin(), c.queries.end(), half(0));
     for (int b = 0; b < c.batch; ++b) {
       for (int qh = 0; qh < h; ++qh) c.queries[(size_t(b)*h+qh)*128] = half(1);
@@ -167,7 +169,8 @@ static void correctness() {
         for (int d = 0; d < 128; ++d) {
           // false: one score=0 per block and others=-200 -> valid block LSE=0.
           // true: negative/positive block scores exercise softmax and merge overflow.
-          float score = large ? (t < 32 ? -200.0f : 200.0f) : (t % 32 == 0 ? 0.0f : -200.0f);
+          float score = large ? ((t / 128) % 2 == 0 ? -200.0f : 200.0f)
+                              : (t % 32 == 0 ? 0.0f : -200.0f);
           c.keys[c.kv(b,t,kh,d)] = half(d == 0 ? score * std::sqrt(128.0f) : 0);
           c.values[c.kv(b,t,kh,d)] = half(float(t / 32 + 1));
         }
@@ -175,6 +178,29 @@ static void correctness() {
     }
     c.import(0);
     for (int repeat = 0; repeat < 12; ++repeat) { c.attention(); c.reference(); }
+    ++cases;
+  }
+  // Fail after earlier blocks have been accumulated, in both full and tail tasks.
+  // Check both physical-page bounds and recovery without stale partial results.
+  for (bool parallel : {false, true}) {
+    Case boundary(32, 32, 4, {0, 7*32, 0});
+    boundary.cache.set_parallel_reduce(parallel);
+    boundary.import(0);
+    for (int block : {1, 3, 4, 6}) {
+      int& entry = boundary.table[boundary.stride + block];
+      int saved = entry;
+      for (int invalid : {-1, boundary.batch * (boundary.tokens / boundary.block)}) {
+        entry = invalid;
+        expect_error([&] { boundary.attention(); });
+        entry = saved;
+        boundary.attention(); boundary.reference();
+      }
+    }
+    // A table shorter than the effective logical block count must fail before dispatch.
+    expect_error([&] { boundary.cache.attn(boundary.queries.data(), boundary.output.data(),
+        boundary.lse.data(), 0, 0, 1, boundary.batch, 6, boundary.table.data(),
+        boundary.lengths.data(), &boundary.pool); });
+    boundary.attention(); boundary.reference();
     ++cases;
   }
   Case c(32, 32, 4, {32, 0, 1});
@@ -263,7 +289,7 @@ static void profile_smoke() {
     cache.profile_write(test_parallel_reduce ? "build/dense_validation/profile_smoke.txt"
                                             : "build/dense_validation/profile_smoke_locked.txt", threads == 64);
   }
-  std::cout << "PASS: 32/64-thread profile, reset, warmup exclusion, output and LSE; expected calls=3 tasks=24576 per group\n";
+  std::cout << "PASS: 32/64-thread profile, reset, warmup exclusion, output and LSE; expected calls=3 tasks=6144 per group\n";
 }
 
 int main(int argc, char** argv) {

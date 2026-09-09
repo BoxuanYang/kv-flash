@@ -97,7 +97,7 @@ class KVCache {
   void profile_reset(int threads);
   void profile_enable(bool enabled);
   void profile_write(const char* path, bool append);
-  // 保留原 block task；true 使用无锁的两阶段 reduce，false 使用原带锁归并作对照。
+  // 两种模式均使用最多四个连续逻辑 block 的 task；false 使用带锁归并作对照。
   void set_parallel_reduce(bool enabled);
 
   /**
@@ -357,6 +357,7 @@ class KVCache {
   void clear_kvcache_all_layers(int* block_table, int* cache_seqlens, int batch_size,
                                 int max_block_num, WorkerPool* backend);
  private:
+  static constexpr int kBlocksPerTask = 4;
   bool profile_enabled_ = false;
   int profile_threads_ = 0;
   long long profile_calls_ = 0;
@@ -368,10 +369,10 @@ class KVCache {
   long long profile_reduce_count_[64][16];
   double profile_reduce_time_[64][16];
   bool parallel_reduce_ = true;
-  // 每个 block task 独占一个输出槽。容量只在需要增长时调整，后续调用复用。
-  std::vector<float> reduce_block_output_;
+  // 每个四块 task 独占一个局部归并结果槽。容量只在需要增长时调整，后续调用复用。
+  std::vector<float> reduce_task_output_;
   // 每 task 预留 32 个 float，避免相邻 task 写 LSE 时共享缓存行。
-  std::vector<float> reduce_block_lse_;
+  std::vector<float> reduce_task_lse_;
   void reduce_one_query_head_(int task_id);
 
   // 只统计目标配置的最多 64 个线程。每行仅使用 [0]；行间留空，避免伪共享。
@@ -413,7 +414,7 @@ class KVCache {
 
   // 保持原 block-parallel Attention 所需的 batch/head、锁和线程私有状态。
   std::vector<int> cache_seqlens_;
-  // [batch + 1] 有效 block 任务的前缀和；不是 block_table 的行偏移。
+  // [batch + 1] 四块任务的前缀和；不是 block_table 的行偏移或有效 block 数。
   std::vector<int> task_offsets_;
   // 每个 batch/head 是否已有全局结果；使用字节数组，避免 vector<bool> 的位共享。
   std::vector<std::vector<uint8_t>> output_valid_;
@@ -431,11 +432,11 @@ class KVCache {
   std::vector<std::vector<float>> thread_local_cur_attn_lse_;
   std::vector<std::vector<ggml_fp16_t>> thread_local_probability_fp16_;
 
-  // 重置累计状态，并按每个序列的有效 block 数构建任务前缀和。
+  // 重置累计状态，并按每个 head 的 ceil(有效 block 数 / 4) 构建任务前缀和。
   void attn_initialize_kvhead_(int batch_size, int layer_idx, const int* block_table,
                                int block_table_stride, const int* cache_seqlens);
 
-  // 一个任务计算一个 (batch, KV head, block)，使用现有线程内累计和带锁提交策略。
+  // 一个任务计算同一 (batch, KV head) 的最多四个连续逻辑 block，并在本地归并。
   void attention_kvhead_(const ggml_fp16_t* q_in, ggml_fp16_t* output,
                          float* attn_lse, int batch_size, WorkerPool* backend);
 

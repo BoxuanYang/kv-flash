@@ -5,6 +5,7 @@
 From the repository root on the lab Linux machine, after rebuilding kt-kernel:
   numactl --cpunodebind=0 --membind=0 python kt-kernel/test/dense_kvcache/test_cpu_profile.py
 
+Each compute task covers up to four consecutive blocks of one sequence/KV head.
 C++ writes both groups to cpu_profile.txt in the repository root.
 """
 
