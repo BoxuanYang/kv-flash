@@ -93,6 +93,11 @@ class KVCache {
    */
   KVCache(KVCacheConfig config);
 
+  // 在同步 attn 调用之间操作。reset 清零，enable 排除预热，write 由 C++ 汇总写文件。
+  void profile_reset(int threads);
+  void profile_enable(bool enabled);
+  void profile_write(const char* path, bool append);
+
   /**
    * @brief 调整线程工作区容量，不改变 WorkerPool 的线程数。
    *
@@ -350,6 +355,31 @@ class KVCache {
   void clear_kvcache_all_layers(int* block_table, int* cache_seqlens, int batch_size,
                                 int max_block_num, WorkerPool* backend);
  private:
+  bool profile_enabled_ = false;
+  int profile_threads_ = 0;
+  long long profile_calls_ = 0;
+  double profile_wall_time_ = 0.0;
+  double profile_init_time_ = 0.0;
+  double profile_pool_time_ = 0.0;
+  double profile_output_time_ = 0.0;
+
+  // 只统计目标配置的最多 64 个线程。每行仅使用 [0]；行间留空，避免伪共享。
+  // 同一行只有对应线程写，主线程在线程池完成后读取；不需要统计锁。
+  long long profile_task_count_[64][16];
+  long long profile_flush_count_[64][16];
+  double profile_qk_time_[64][16];
+  double profile_softmax_time_[64][16];
+  double profile_convert_time_[64][16];
+  double profile_pv_time_[64][16];
+  double profile_merge_time_[64][16];
+  double profile_sync_time_[64][16];
+  double profile_writeback_time_[64][16];
+  double profile_task_time_[64][16];
+  double profile_final_flush_time_[64][16];
+  double profile_gap_time_[64][16];
+  double profile_last_end_[64][16];
+  void profile_get_times_(int thread_id, double* times);
+
   KVCacheConfig config_;
   int n_gqa_;
   int cache_total_len_ = 0;

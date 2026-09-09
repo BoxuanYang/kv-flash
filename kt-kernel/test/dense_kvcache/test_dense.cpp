@@ -215,8 +215,46 @@ static void benchmark() {
               << " p95_us=" << samples[95] << '\n';
   }
 }
+// 共享只读物理 block，低内存验证 profiling；这里的耗时不是实验室性能数据。
+static void profile_smoke() {
+  static Half query[64 * 32 * 128] = {0};
+  static Half output[64 * 32 * 128];
+  static float lse[64 * 32];
+  static Half keys[128 * 4 * 128] = {0};
+  static Half values[128 * 4 * 128];
+  int table[64 * 32] = {0};
+  int lengths[64];
+  for (int i = 0; i < 128 * 4 * 128; ++i) values[i] = half(0.25f);
+  for (int i = 0; i < 64; ++i) lengths[i] = 4096;
+  for (int threads = 32; threads <= 64; threads += 32) {
+    WorkerPool pool(threads, 0);
+    dense::KVCache cache(dense::KVCacheConfig(1, 4, 32, 128, 128, GGML_TYPE_F16, 1, 64, threads));
+    int zero = 0;
+    cache.update_kvcache_fp16(keys, values, 0, table, 1, 32, &zero, 128, &pool);
+    cache.profile_reset(threads);
+    cache.profile_enable(true);
+    cache.attn(query, output, lse, 0, 0, 1, 64, 32, table, lengths, &pool);
+    cache.profile_reset(threads);  // 上一次采样必须清除；reset 同时关闭计时。
+    for (int repeat = 0; repeat < 5; ++repeat) {
+      cache.profile_enable(repeat == 1 || repeat == 2 || repeat == 4);
+      cache.attn(query, output, lse, 0, 0, 1, 64, 32, table, lengths, &pool);
+      for (int i = 0; i < 64 * 32 * 128; ++i) {
+        require(std::abs(real(output[i]) - 0.25f) < 0.002f, "profile changed output");
+      }
+      for (int i = 0; i < 64 * 32; ++i) {
+        require(std::abs(lse[i] - std::log(4096.0f)) < 0.004f, "profile changed LSE");
+      }
+    }
+    cache.profile_enable(false);
+    cache.profile_write("build/dense_validation/profile_smoke.txt", threads == 64);
+  }
+  std::cout << "PASS: 32/64-thread profile, reset, warmup exclusion, output and LSE; expected calls=3 tasks=24576 per group\n";
+}
+
 int main(int argc, char** argv) {
   try {
-    if (argc > 1 && std::string(argv[1]) == "--bench") benchmark(); else correctness();
+    if (argc > 1 && std::string(argv[1]) == "--bench") benchmark();
+    else if (argc > 1 && std::string(argv[1]) == "--profile-smoke") profile_smoke();
+    else correctness();
   } catch (const std::exception& e) { std::cerr << "FAIL: " << e.what() << '\n'; return 1; }
 }
