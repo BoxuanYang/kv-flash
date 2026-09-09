@@ -1,0 +1,7 @@
+Qwen3 30B:
+
+98304 bytes / token
+
+24 GB = 31744 tokens of KVCache
+
+所以，若batch = 32, 每batch = 992 token时，会出现offload
