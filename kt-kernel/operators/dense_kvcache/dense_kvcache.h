@@ -93,10 +93,7 @@ class KVCache {
    */
   KVCache(KVCacheConfig config);
 
-  // 在同步 attn 调用之间操作。reset 清零，enable 排除预热，write 由 C++ 汇总写文件。
-  void profile_reset(int threads);
-  void profile_enable(bool enabled);
-  void profile_write(const char* path, bool append);
+  // 仅在同步 attn 调用之间切换归并模式。
   // 两种模式均使用最多四个连续逻辑 block 的 task；false 使用带锁归并作对照。
   void set_parallel_reduce(bool enabled);
 
@@ -358,39 +355,12 @@ class KVCache {
                                 int max_block_num, WorkerPool* backend);
  private:
   static constexpr int kBlocksPerTask = 4;
-  bool profile_enabled_ = false;
-  int profile_threads_ = 0;
-  long long profile_calls_ = 0;
-  double profile_wall_time_ = 0.0;
-  double profile_init_time_ = 0.0;
-  double profile_pool_time_ = 0.0;
-  double profile_output_time_ = 0.0;
-  double profile_reduce_pool_time_ = 0.0;
-  long long profile_reduce_count_[64][16];
-  double profile_reduce_time_[64][16];
   bool parallel_reduce_ = true;
   // 每个四块 task 独占一个局部归并结果槽。容量只在需要增长时调整，后续调用复用。
   std::vector<float> reduce_task_output_;
   // 每 task 预留 32 个 float，避免相邻 task 写 LSE 时共享缓存行。
   std::vector<float> reduce_task_lse_;
   void reduce_one_query_head_(int task_id);
-
-  // 只统计目标配置的最多 64 个线程。每行仅使用 [0]；行间留空，避免伪共享。
-  // 同一行只有对应线程写，主线程在线程池完成后读取；不需要统计锁。
-  long long profile_task_count_[64][16];
-  long long profile_flush_count_[64][16];
-  double profile_qk_time_[64][16];
-  double profile_softmax_time_[64][16];
-  double profile_convert_time_[64][16];
-  double profile_pv_time_[64][16];
-  double profile_merge_time_[64][16];
-  double profile_sync_time_[64][16];
-  double profile_writeback_time_[64][16];
-  double profile_task_time_[64][16];
-  double profile_final_flush_time_[64][16];
-  double profile_gap_time_[64][16];
-  double profile_last_end_[64][16];
-  void profile_get_times_(int thread_id, double* times);
 
   KVCacheConfig config_;
   int n_gqa_;

@@ -110,6 +110,8 @@ Linux x86-64 需要 g++、libnuma-dev、libhwloc-dev，以及 AVX2/FMA/F16C。
 bash kt-kernel/test/dense_kvcache/run.sh release
 bash kt-kernel/test/dense_kvcache/run.sh sanitize
 bash kt-kernel/test/dense_kvcache/run.sh release --bench
+bash kt-kernel/test/dense_kvcache/run.sh release --thread-smoke
+bash kt-kernel/test/dense_kvcache/run.sh release --legacy-reduce --thread-smoke
 ```
 
 测试使用本仓库的 AVX2 GEMM（含 IQK 分派）和真实 WorkerPool，参考值为完整序列 FP64 attention。
@@ -121,6 +123,14 @@ bash kt-kernel/test/dense_kvcache/run.sh release --bench
 sanitize 检查 dense 实现和 GEMM 包装的 ASan/UBSan；依赖库未全部插桩。
 关闭 LeakSanitizer，因为现有 WorkerPool 的 hwloc topology 生命周期不在本次修改范围内。
 这不替代完整 Python/CUDA 扩展构建，也不替代目标服务器上的多 NUMA 吞吐测试。
+
+`--thread-smoke` 使用共享只读物理页，验证 32/64 线程下的输出、LSE 和重复调用。
+attention 算子内的计时、计数、报告导出及三个 `profile_*` 绑定已移除。
+整体性能仍可通过 `--bench` 或 `test_cpu_perf.py` 从调用外部计时，例如：
+
+```bash
+numactl --cpunodebind=0 --membind=0 python kt-kernel/test/dense_kvcache/test_cpu_perf.py --batch-sizes 64 --sequence-lengths 4096 --threads 32 64 --reduce-mode two-phase
+```
 
 ## Python / FlashAttention 对照
 
@@ -154,8 +164,6 @@ python kt-kernel/test/dense_kvcache/test_flash_attention.py --threads 1 4 --bloc
 均通过 Release 和 ASan/UBSan 的 20 组场景及额外错误恢复检查。
 覆盖完整四块任务、1～3 块尾任务、部分有效尾块、空序列、随机物理页映射、
 任务中途遇到负数/越界物理页后的失败恢复，以及跨任务的极端 score 和 FP64 参考对照。
-两种模式的 32/64 线程 profiling smoke test 均通过；每组 3 次调用共 6144 个计算 task，
-two-phase 模式另有 6144 个 reduce task，flush 为 0。
 这次未测目标服务器长上下文性能，以下旧版性能数据不代表四块任务版本的加速比。
 
 ## 历史验证结果（2026-09-07）

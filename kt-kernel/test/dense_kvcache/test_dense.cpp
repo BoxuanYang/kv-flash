@@ -254,8 +254,8 @@ static void benchmark() {
               << " p95_us=" << samples[95] << '\n';
   }
 }
-// 共享只读物理 block，低内存验证 profiling；这里的耗时不是实验室性能数据。
-static void profile_smoke() {
+// 共享只读物理 block，低内存验证 32/64 线程下的输出和重复调用。
+static void thread_smoke() {
   static Half query[64 * 32 * 128] = {0};
   static Half output[64 * 32 * 128];
   static float lse[64 * 32];
@@ -271,25 +271,17 @@ static void profile_smoke() {
     cache.set_parallel_reduce(test_parallel_reduce);
     int zero = 0;
     cache.update_kvcache_fp16(keys, values, 0, table, 1, 32, &zero, 128, &pool);
-    cache.profile_reset(threads);
-    cache.profile_enable(true);
-    cache.attn(query, output, lse, 0, 0, 1, 64, 32, table, lengths, &pool);
-    cache.profile_reset(threads);  // 上一次采样必须清除；reset 同时关闭计时。
     for (int repeat = 0; repeat < 5; ++repeat) {
-      cache.profile_enable(repeat == 1 || repeat == 2 || repeat == 4);
       cache.attn(query, output, lse, 0, 0, 1, 64, 32, table, lengths, &pool);
       for (int i = 0; i < 64 * 32 * 128; ++i) {
-        require(std::abs(real(output[i]) - 0.25f) < 0.002f, "profile changed output");
+        require(std::abs(real(output[i]) - 0.25f) < 0.002f, "32/64-thread output mismatch");
       }
       for (int i = 0; i < 64 * 32; ++i) {
-        require(std::abs(lse[i] - std::log(4096.0f)) < 0.004f, "profile changed LSE");
+        require(std::abs(lse[i] - std::log(4096.0f)) < 0.004f, "32/64-thread LSE mismatch");
       }
     }
-    cache.profile_enable(false);
-    cache.profile_write(test_parallel_reduce ? "build/dense_validation/profile_smoke.txt"
-                                            : "build/dense_validation/profile_smoke_locked.txt", threads == 64);
   }
-  std::cout << "PASS: 32/64-thread profile, reset, warmup exclusion, output and LSE; expected calls=3 tasks=6144 per group\n";
+  std::cout << "PASS: 32/64-thread output, LSE and repeated calls\n";
 }
 
 int main(int argc, char** argv) {
@@ -300,7 +292,7 @@ int main(int argc, char** argv) {
       ++argv;
     }
     if (argc > 1 && std::string(argv[1]) == "--bench") benchmark();
-    else if (argc > 1 && std::string(argv[1]) == "--profile-smoke") profile_smoke();
+    else if (argc > 1 && std::string(argv[1]) == "--thread-smoke") thread_smoke();
     else correctness();
   } catch (const std::exception& e) { std::cerr << "FAIL: " << e.what() << '\n'; return 1; }
 }
